@@ -1,0 +1,15 @@
+{
+  "hostelName": 120,
+  "hostelAddress": 250,
+  "floor": 40,
+  "room": 40,
+  "mess": 10,
+  "occupation": 60,
+  "category": 80,
+  "tenantName": 120,
+  "phone": 40,
+  "note": 500,
+  "recordId": 80,
+  "rentHistoryEntries": 50,
+  "roomCapacity": 100
+}

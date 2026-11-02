@@ -1,0 +1,181 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function ownsHostel(hostelId) {
+      return signedIn() && request.auth.uid == hostelId;
+    }
+
+    function validDate(value) {
+      return value is string
+        && value.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function validMonth(value) {
+      return value is string && value.matches('^[0-9]{4}-(0[1-9]|1[0-2])$');
+    }
+
+    function validAmount(value) {
+      return value is number && value > 0 && value <= 100000000;
+    }
+
+    function validSyncTimestamp(value) {
+      return value is string
+        && value.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$');
+    }
+
+    function validSyncMetadata(data) {
+      return (!data.keys().hasAny(['createdAt']) || validSyncTimestamp(data.createdAt))
+        && (!data.keys().hasAny(['updatedAt']) || validSyncTimestamp(data.updatedAt))
+        && (!data.keys().hasAny(['deletedAt']) || validSyncTimestamp(data.deletedAt));
+    }
+
+    function validInitialRentHistory(data) {
+      return !data.keys().hasAny(['rentHistory'])
+        || (
+          data.rentHistory is list
+          && data.rentHistory.size() >= 1
+          && data.rentHistory.size() <= 50
+          && data.rentHistory[0] is map
+          && data.rentHistory[0].keys().hasAll(['effectiveMonth', 'amount'])
+          && validMonth(data.rentHistory[0].effectiveMonth)
+          && data.rentHistory[0].effectiveMonth == data.joinDate.substring(0, 7)
+          && validAmount(data.rentHistory[0].amount)
+          && data.rentHistory[data.rentHistory.size() - 1] is map
+          && data.rentHistory[data.rentHistory.size() - 1].keys().hasAll(['effectiveMonth', 'amount'])
+          && validMonth(data.rentHistory[data.rentHistory.size() - 1].effectiveMonth)
+          && data.rentHistory[data.rentHistory.size() - 1].amount == data.rent
+        );
+    }
+
+    function validRecord(hostelId, collection) {
+      let data = request.resource.data;
+      return validSyncMetadata(data)
+        && (collection == 'Tenants'
+        ? data.keys().hasAll(['name', 'phone', 'floor', 'room', 'joinDate', 'occupation', 'mess', 'rent', 'status'])
+          && data.keys().hasOnly(['name', 'phone', 'floor', 'room', 'joinDate', 'billingStartDate', 'occupation', 'mess', 'rent', 'status', 'rentHistory', 'createdAt', 'updatedAt', 'deletedAt'])
+          && data.name is string && data.name.size() > 0 && data.name.size() <= 120
+          && data.phone is string && data.phone.size() <= 40
+          && data.floor is string && data.floor.size() > 0 && data.floor.size() <= 40
+          && data.room is string && data.room.size() > 0 && data.room.size() <= 40
+          && data.occupation is string && data.occupation.size() <= 60
+          && data.mess is string && data.mess.size() <= 10
+          && validAmount(data.rent)
+          && validDate(data.joinDate)
+          && (
+            !data.keys().hasAny(['billingStartDate'])
+            || validMonth(data.billingStartDate)
+          )
+          && data.status in ['Active', 'Inactive']
+          && (
+            !data.keys().hasAny(['rentHistory'])
+            || (
+              data.rentHistory is list
+              && data.rentHistory.size() >= 1
+              && data.rentHistory.size() <= 50
+            )
+          )
+          && validInitialRentHistory(data)
+        : collection == 'Payments'
+          ? data.keys().hasAll(['tenantId', 'tenantName', 'month', 'amount', 'date', 'note'])
+            && data.keys().hasOnly(['tenantId', 'tenantName', 'month', 'amount', 'date', 'note', 'createdAt', 'updatedAt', 'deletedAt'])
+            && data.tenantId is string && data.tenantId.size() > 0
+            && data.tenantName is string && data.tenantName.size() <= 120
+            && data.note is string && data.note.size() <= 500
+            && exists(/databases/$(database)/documents/hostels/$(hostelId)/Tenants/$(data.tenantId))
+            && get(/databases/$(database)/documents/hostels/$(hostelId)/Tenants/$(data.tenantId)).data.name == data.tenantName
+            && validAmount(data.amount)
+            && validMonth(data.month)
+            && validDate(data.date)
+          : collection == 'Expenses'
+            ? data.keys().hasAll(['date', 'amount', 'category', 'note'])
+              && data.keys().hasOnly(['date', 'amount', 'category', 'note', 'createdAt', 'updatedAt', 'deletedAt'])
+              && validAmount(data.amount)
+              && validDate(data.date)
+              && data.category is string && data.category.size() > 0 && data.category.size() <= 80
+              && data.note is string && data.note.size() <= 500
+            : collection == 'Rooms'
+              ? data.keys().hasAll(['floor', 'room', 'capacity'])
+                && data.keys().hasOnly(['floor', 'room', 'capacity', 'occupiedTenantIds', 'createdAt', 'updatedAt', 'deletedAt'])
+                && data.floor is string && data.floor.size() > 0 && data.floor.size() <= 40
+                && data.room is string && data.room.size() > 0 && data.room.size() <= 40
+                && data.capacity is int && data.capacity > 0 && data.capacity <= 100
+                && (!data.keys().hasAny(['occupiedTenantIds'])
+                  || (data.occupiedTenantIds is list && data.occupiedTenantIds.size() <= data.capacity))
+              : false);
+    }
+
+    function validTenantUpdate() {
+      let data = request.resource.data;
+      let oldData = resource.data;
+      let oldHistoryLength = oldData.keys().hasAny(['rentHistory']) ? oldData.rentHistory.size() : 0;
+      let hasSameHistory = data.keys().hasAny(['rentHistory']) == oldData.keys().hasAny(['rentHistory'])
+        && (!data.keys().hasAny(['rentHistory']) || data.rentHistory == oldData.rentHistory);
+      return (
+          data.rent == oldData.rent
+          && hasSameHistory
+          && (!oldData.keys().hasAny(['createdAt']) || data.createdAt == oldData.createdAt)
+          && data.diff(oldData).affectedKeys().hasOnly([
+            'name', 'phone', 'floor', 'room', 'joinDate', 'billingStartDate',
+            'occupation', 'mess', 'status', 'createdAt', 'updatedAt', 'deletedAt'
+          ])
+        )
+        || (
+          data.rentHistory is list
+          && data.rentHistory.size() == oldHistoryLength + 1
+          && data.rent == data.rentHistory[data.rentHistory.size() - 1].amount
+          && (!oldData.keys().hasAny(['createdAt']) || data.createdAt == oldData.createdAt)
+          && data.diff(oldData).affectedKeys().hasOnly(['rentHistory', 'rent', 'createdAt', 'updatedAt', 'deletedAt'])
+        );
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() && request.auth.uid == userId;
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasAll(['uid', 'email', 'hostelId'])
+        && request.resource.data.keys().hasOnly(['uid', 'email', 'hostelId'])
+        && request.resource.data.uid == userId
+        && request.resource.data.hostelId == userId
+        && request.resource.data.email is string
+        && getAfter(/databases/$(database)/documents/hostels/$(userId)).data.ownerId == userId;
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.hostelId == resource.data.hostelId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['email'])
+        && request.resource.data.email is string;
+      allow delete: if false;
+    }
+
+    match /hostels/{hostelId} {
+      allow read: if signedIn() && request.auth.uid == hostelId;
+      allow create: if signedIn()
+        && request.auth.uid == hostelId
+        && request.resource.data.keys().hasAll(['name', 'address', 'ownerId'])
+        && request.resource.data.keys().hasOnly(['name', 'address', 'ownerId'])
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120
+        && request.resource.data.address is string && request.resource.data.address.size() > 0 && request.resource.data.address.size() <= 250
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.hostelId == hostelId;
+      allow update: if ownsHostel(hostelId)
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'address'])
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120
+        && request.resource.data.address is string && request.resource.data.address.size() > 0 && request.resource.data.address.size() <= 250;
+      allow delete: if false;
+
+      match /{collection}/{recordId} {
+        allow read: if ownsHostel(hostelId);
+        allow create: if ownsHostel(hostelId) && validRecord(hostelId, collection);
+        allow update: if ownsHostel(hostelId)
+          && validRecord(hostelId, collection)
+          && (collection != 'Tenants' || validTenantUpdate());
+        allow delete: if false;
+      }
+    }
+  }
+}
