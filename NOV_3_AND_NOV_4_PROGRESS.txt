@@ -1,0 +1,578 @@
+HOSTELAGENT PROJECT - PROGRESS AND TEST HANDOFF
+Updated: November 5, 2026 (local live rehearsal and packaging status)
+
+PURPOSE
+=======
+
+This note records the work completed for the Nov 3 AI/data foundation, the
+Nov 4 approval-gated PayPal rent flow and Rent Agent, plus the Nov 5 live local
+rehearsal and remaining packaging/deployment work. It distinguishes
+implemented code, automated verification, Sandbox activity, and remaining
+checks. It does not contain API keys,
+passwords, Firebase UIDs, or other credentials.
+
+
+1. PROJECT STRATEGY AND SCOPE
+=============================
+
+The project is being positioned as an AI-powered hostel operations app with
+PayPal Sandbox rent collection. The priority is one understandable transaction
+loop:
+
+  identify overdue rent
+  -> prepare a tenant-specific collection request
+  -> owner approves by requesting a PayPal order
+  -> tenant completes or cancels Sandbox checkout
+  -> server checks the PayPal result
+  -> owner syncs the result
+  -> app records a payment only after PayPal says COMPLETED
+
+Money movement is approval-gated. The AI/model does not create, capture, or
+record payments. The owner initiates an order, the tenant authorizes checkout
+with PayPal, and PayPal is the status authority.
+
+Payouts, subscriptions, dynamic pricing, and automatic tenant messaging remain
+out of this critical path.
+
+
+2. DEMO DATA
+============
+
+Created src/demo/seed.ts. The demo loader writes a Maple House sample workspace
+to the browser's local IndexedDB:
+
+- Daniel Reyes: room 4B, bed 2, monthly rent $450.
+  - First recent month paid in full: $450.
+  - Next recent month partially paid: $200 of $450.
+  - Current recent month unpaid: $0 paid of $450.
+  - Outstanding: $250 + $450 = $700 across two months.
+- Mina Okafor: room 2A, monthly rent $380.
+  - Two recent months paid in full.
+  - Current recent month unpaid.
+  - Outstanding: $380 across one month.
+- Leo, Priya, and Sam: their recent months are paid in full.
+  - Outstanding: $0 each.
+
+The seed dates and month keys are generated relative to the machine's current
+date, so the demo rolls forward rather than being fixed to an old year/month.
+The loader checks that the current workspace is empty before inserting demo
+records. It refuses to overwrite a non-empty profile and recommends a fresh
+browser profile instead.
+
+The demo was previously loaded successfully at ?demo=1. The dashboard showed
+Daniel at $700 and Mina at $380. Do not reload the demo seed in a workspace
+that already contains manually entered or captured payments.
+
+The PWA's displayed currency formatting was changed from PKR to USD for the
+project's demo payment amounts. This changes presentation; it does not convert
+any already stored numeric values.
+
+
+3. SNAPSHOT CONTRACT AND RENT CALCULATION
+=========================================
+
+Created src/agent/snapshot.ts and a focused snapshot test.
+
+The snapshot contains:
+
+- hostelName
+- asOf date
+- currency (USD)
+- one row per active tenant, including tenantId, fullName, floor, room,
+  monthlyRent, outstandingAmount, monthsOverdue, and recentMonths
+- each recent month includes rentDue, amountPaid, outstandingAmount, and a
+  paid/partial/unpaid status
+
+The snapshot is built from the app's local tenant and payment records and
+existing rent calculation helpers. The test verifies:
+
+- Daniel: $700 outstanding, 2 months overdue, with paid/partial/unpaid month
+  statuses.
+- Mina: $380 outstanding, 1 month overdue.
+- Leo: $0 outstanding, 0 months overdue.
+
+monthsOverdue counts months with a positive unpaid balance as the existing
+rent calculator reports it. The snapshot's recentMonths currently includes
+up to the latest three calendar months.
+
+
+4. AGENT AUTHORITY AND MODEL SETUP
+==================================
+
+Created src/agent/systemPrompt.ts containing the initial Rent Agent rules:
+
+- use only facts in the provided snapshot;
+- do not invent why a tenant is late;
+- quote calculated figures from the snapshot rather than inventing arithmetic;
+- exclude tenants with zero outstanding rent;
+- rank by months overdue, then amount;
+- draft factual, polite reminders;
+- propose only; do not send messages, create/capture payments, or change records;
+- return JSON as required by a future response schema.
+
+At the time of this original Nov 3 section, the prompt was preparatory and the
+live workflow was not implemented. The current workflow and schema are
+documented in the Rent Agent addendum below.
+
+Installed the Vercel AI SDK and Google provider in server/package.json, and
+created server/test-gemini.js with an npm run test:gemini command.
+
+The first configured Gemini Flash-class model returned a temporary high-demand
+error. Retrying with gemini-3.6-flash succeeded and returned a short greeting
+("Hello" / "Hello!"). gemini-3.6-flash is now the smoke test's default and is
+listed in server/.env.example. The real API key is stored locally in the
+ignored server/.env file; do not copy it into chat, screenshots, source code,
+or a VITE_ variable. Rotate any key that was exposed.
+
+The Gemini smoke test proves that the provider can be called from the server.
+It does not mean the production Rent Agent has been wired to call Gemini yet.
+
+
+5. SERVER-SIDE PAYPAL RENT ORDER WORK
+=====================================
+
+Added server/paypal.js:
+
+- obtains and caches a PayPal OAuth token using server-side credentials;
+- uses the Sandbox API base by default;
+- wraps PayPal API requests and request IDs;
+- keeps the PayPal client secret on the server.
+
+Added server/rent-orders.js:
+
+- validates tenant snapshot fields and monthly rows;
+- derives the collection amount by summing rentDue minus amountPaid for the
+  supplied months, floored at zero per month;
+- rejects a mismatch between the derived amount and outstandingAmount, and
+  applies a $5,000 demo cap;
+- creates USD PayPal orders with tenant/month allocation metadata;
+- reuses an open order for the same tenant while the server is running;
+- syncs an order against PayPal, captures an APPROVED order on the server, and
+  validates the capture amount and currency;
+- can recover order metadata from PayPal after server memory is lost, because
+  tenant ID, amount, and month allocations are attached to the PayPal order.
+
+IMPORTANT DATA TRUST LIMITATION:
+The server checks the arithmetic in the snapshot sent by the browser. At this
+stage, the server does not independently read the hostel's authoritative tenant
+and payment records from Firebase before creating an order. Therefore, the
+snapshot-mismatch test proves that changing only outstandingAmount to $1 is
+rejected, but it does not make arbitrary client-supplied rent/payment rows
+authoritative. Keep this demo restricted to the configured owner and Sandbox.
+For production, the backend must fetch or otherwise verify trusted rent data.
+
+
+6. OWNER AUTHENTICATION AND FRONTEND
+====================================
+
+Added server/owner-auth.js using Firebase Admin ID-token verification. The
+backend checks the Firebase UID against OWNER_UID and the Firebase project
+against FIREBASE_PROJECT_ID.
+
+The PWA gets a Firebase ID token from the currently signed-in account and sends
+it as a Bearer token for owner actions. This replaced the proposed
+VITE_OWNER_ACTION_SECRET approach. A VITE_ value is included in browser code
+and is not a secret. If VITE_OWNER_ACTION_SECRET was put in an env file, remove
+it; rotate it if the same value was reused as a real server secret.
+
+Added src/agent/rentOrders.ts for frontend request/sync calls. The backend URL
+comes from VITE_API_BASE_URL and defaults locally to http://localhost:3000.
+The frontend .env.example now includes that local API URL.
+
+The dashboard now shows a Request $... from [tenant] button beside overdue
+tenants. The button is disabled when no signed-in Firebase owner is present.
+The returned PayPal approval link is displayed and is not automatically opened.
+The owner may open it in a second browser profile for the Sandbox buyer.
+
+The owner dashboard also displays the order status and a Sync with PayPal
+button. On COMPLETED only, it records the PayPal capture locally. Payment rows
+are allocated to the actual outstanding months, with stable IDs based on
+capture ID plus month, to prevent duplicate local records when Sync is repeated.
+Non-COMPLETED states do not create payment rows.
+
+
+7. RETURN AND CANCELLATION REDIRECT
+==================================
+
+PayPal's return and cancel URLs point to the backend:
+
+- /api/paypal/return checks/syncs the order with PayPal, then redirects to the
+  PWA dashboard with a result marker.
+- /api/paypal/cancel records the cancellation in the server's in-memory order
+  cache when available, then redirects to the PWA dashboard.
+
+The PWA removes the result query parameters and displays a toast:
+
+- completed: PayPal confirmed payment; Sync the owner dashboard to record it.
+- pending: PayPal did not confirm payment; no payment was recorded.
+- cancelled: checkout was cancelled; no payment was recorded.
+
+The user confirmed that cancellation now redirects back to the app. A screenshot
+showed the toast "PayPal checkout cancelled. No payment was recorded." and the
+seeded balance remained $1,080.
+
+The cancellation order card still showed PAYER_ACTION_REQUIRED in the screenshot
+after redirect, even though the toast and unchanged balance indicated that no
+payment was recorded. This order-status display should be checked with Sync and
+may need a UI/status-state follow-up. The cancellation redirect itself works.
+
+
+8. AUTOMATED VERIFICATION
+========================
+
+Frontend:
+- The original Nov 3/Nov 4 check had 19 tests passing. After the Rent Agent
+  work, the current suite has 23 tests passing.
+- npm run build: TypeScript and production Vite build passed.
+- snapshot tests cover Daniel, Mina, and paid tenant calculations.
+
+Backend:
+- The original Nov 4 rent-order suite had 3 Node tests. The current suite has
+  8 tests passing, including five Rent Agent cases.
+- covers the $700 month-derived amount and $1 mismatch rejection;
+- covers 401 when the owner token is missing;
+- mocks PayPal to test concurrent order reuse and completed-order recovery
+  after in-memory server state is absent.
+- node syntax checks passed for the server modules.
+- npm audit --omit=dev reported 0 production vulnerabilities after compatible
+  dependency fixes.
+
+The backend tests use mocked PayPal responses; they are not a substitute for
+testing a real Sandbox buyer checkout.
+
+
+9. MANUAL SANDBOX TESTS OBSERVED
+===============================
+
+Daniel successful payment:
+- Owner request created a PayPal order and displayed an approval link.
+- The Sandbox buyer completed payment in a separate browser context.
+- PayPal return page showed COMPLETED and a capture ID.
+- Owner Sync recorded the $700 payment.
+- Dashboard then showed $380 outstanding (Mina's balance).
+
+Mina successful payment in a separate attempt/profile:
+- A later screenshot showed Mina's $380 order as COMPLETED with a capture ID.
+- The dashboard then showed $0 outstanding.
+- This was an actual Sandbox payment, not a cancellation.
+
+Mina cancellation in a subsequent seeded browser profile:
+- Checkout was cancelled instead of paid.
+- PayPal redirected back to the app after the redirect change.
+- App showed the cancellation toast and the seeded $1,080 outstanding total
+  remained visible, indicating that no payment was recorded in that profile.
+- The card still showed PAYER_ACTION_REQUIRED; press Sync and inspect the
+  resulting status/payment history before treating every cancellation-state
+  detail as fully verified.
+
+Browser profiles have separate IndexedDB/local data. Therefore, dashboard
+balances differ by profile:
+- one profile after Daniel capture: $380 outstanding;
+- a separate profile after both Daniel and Mina capture: $0 outstanding;
+- a fresh seeded profile after Mina cancellation: $1,080 outstanding.
+
+Do not treat these as one shared database, and do not reload ?demo=1 in a
+profile containing saved payments. The demo seed refuses to load into a
+non-empty workspace.
+
+
+10. CONFIGURATION NOTES
+=======================
+
+Root PWA .env:
+- VITE_API_BASE_URL=http://localhost:3000 for local development.
+- Firebase web app settings already exist in src/firebaseConfig.ts for the
+  configured project, so the VITE_FIREBASE_* entries are overrides, not
+  required duplicates.
+- VITE_FIREBASE_APPCHECK_SITE_KEY is optional unless App Check is configured.
+- Never put PayPal secrets, Firebase Admin credentials, or shared private
+  secrets in VITE_ variables.
+
+server/.env (local, ignored by Git):
+- Sandbox PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET;
+- PUBLIC_BASE_URL=http://localhost:3000;
+- ALLOWED_ORIGIN matching the local PWA origin;
+- FIREBASE_PROJECT_ID;
+- OWNER_UID equal to the Firebase Authentication UID allowed to request rent;
+- `GOOGLE_GENERATIVE_AI_API_KEY` and `GOOGLE_GENERATIVE_AI_MODEL` for Rent
+  Agent generation and the separate Gemini provider smoke test.
+
+The server must be restarted after editing server/.env. The PWA must be
+restarted/rebuilt after changing VITE_ variables.
+
+
+11. CURRENT HANDOFF / NEXT CHECKS (UPDATED NOV 5)
+================================================
+
+Completed:
+- Nov 3 demo seed and rent snapshot contract.
+- Nov 4 owner-authenticated PayPal Sandbox request/capture/status-sync path.
+- Nov 4 owner-authenticated Rent Agent endpoint, deterministic server ranking,
+  Gemini prose generation, strict membership/amount rebuilding, and
+  rules-based fallback.
+- Firebase duplicate-room/payment sync repairs without weakening Firestore
+  rules or deleting duplicate room documents.
+- Stale PayPal order-card cleanup when local data is erased, when its tenant
+  is absent after startup, or after a fresh successful Rent Agent analysis.
+- Local live rehearsal on Nov 5: Gemini returned source `gemini`; Daniel
+  ranked #1 at $700 and Mina #2 at $380; paid Leo, Priya, and Sam were absent;
+  Copy reminder succeeded; owner Request created a distinct $700 Sandbox
+  order; buyer paid in full; owner Sync showed `COMPLETED`, recorded the
+  payment locally, and reduced the displayed balance from $1,080 to $380.
+- Latest automated verification: 29 frontend tests pass, 9 server tests pass,
+  and `npm run build` succeeds.
+
+Important scope caveats:
+- The Nov 5 run used the existing signed-in Xyz workspace, not a clean Maple
+  House profile. The earlier `?demo=1` page was not empty and correctly
+  refused to overwrite it. Do not describe that run as B1/clean-profile
+  verification.
+- After successful local payment recording, the owner page showed
+  `Offline · 4 pending changes`. PayPal completion and local payment recording
+  succeeded; Firebase cloud sync of those queued changes was not confirmed.
+- One older queued payment references tenant ID
+  `f152cada-d3f7-4e15-b5b4-bf2677d84557`, which is missing locally and in
+  cloud data. Its original owner is unknown. Keep it isolated; do not attach
+  it to Ali or another tenant, and do not delete it unless it is positively
+  identified as test-only. It is not part of the demo story.
+- No judge-facing server/PWA deployment has been verified yet. Do not claim
+  deployed checkout or cloud sync is ready.
+- Browser-supplied snapshot data is not an authoritative production ledger.
+  Keep the demo owner-restricted and Sandbox-only.
+
+Remaining critical path:
+1. Prepare a genuinely empty browser profile and load `?demo=1`; check Maple
+   House, Daniel $700, Mina $380, and paid tenants at $0. Do not clear the
+   existing Xyz workspace to achieve this.
+2. Resolve or safely isolate the identified orphan payment only after
+   confirming whether it is test-only; leave it untouched if uncertain.
+3. Deploy the Node server and PWA with exact CORS/PayPal return origins and
+   server-only credentials, then repeat the buyer checkout on deployed URLs.
+4. Update the Devpost entry and record the sub-3-minute video only after the
+   clean-profile and deployed rehearsal.
+
+Never share `.env` screenshots or credential values. Rotate secrets that
+appeared in chat or screenshots.
+
+
+12. NOV 5 RENT AGENT IMPLEMENTATION (COMPLETED NOV 4)
+=====================================================
+
+Implemented the amended Nov 5 plan in the project on Nov 4:
+
+Server:
+- Added POST /api/agent/analyze and protected it with the existing Firebase
+  owner-auth middleware. Missing/invalid owner credentials are rejected by the
+  same middleware used by rent actions.
+- Added server/rent-agent.js. It validates the submitted snapshot, limits it
+  to 100 tenants and three recent months per tenant, rejects duplicate IDs,
+  filters to positive outstanding balances, and ranks deterministically by
+  monthsOverdue descending then outstandingAmount descending (original order
+  breaks exact ties).
+- Gemini is called only for overdue data, using the server-side
+  GOOGLE_GENERATIVE_AI_API_KEY and GOOGLE_GENERATIVE_AI_MODEL (default
+  gemini-3.6-flash), structured JSON output, no retries, and a 25-second
+  timeout. No Gemini key is exposed to Vite/browser code.
+- The server rebuilds each output case from its own ranked snapshot list:
+  IDs, rank, outstanding amount, and currency are server-controlled. A model
+  cannot add a tenant, change money, reorder cases, or drop omitted tenants.
+- An empty overdue list returns source=rules without a model call. Invalid
+  requests return HTTP 400. Model/key/provider/output failures are logged and
+  return source=rules_fallback with a warning and template-generated cases.
+- Template explanations cite recent month balances; template reminders use
+  factual, polite wording, do not add fees or deadlines, and include the
+  hostel name.
+
+PWA:
+- Added src/agent/rentAgent.ts for the authenticated analysis request.
+- Added the Dashboard Run Rent Agent button, loading and error states, the
+  source badge, warning display, ranked proposal cards, and Copy reminder.
+- Each card has a separate Request action. Rent Agent never creates or
+  captures PayPal orders and never sends reminders. A PayPal request is only
+  created after the owner clicks Request, using the existing rent-order flow.
+- Cleared old analysis output when tenant/payment data or the signed-in user
+  changes, avoiding stale proposals after local records are updated.
+- Updated the system prompt and README setup instructions, including the
+  server-only Gemini key and known limitation that rent data comes from a
+  client-provided snapshot rather than an authoritative backend ledger.
+
+Files added/updated for this implementation:
+- server/rent-agent.js
+- server/rent-agent.node-test.js
+- server/index.js
+- server/package.json (server test command includes the new test file)
+- src/agent/rentAgent.ts
+- src/agent/rentOrders.ts
+- src/agent/systemPrompt.ts
+- src/App.tsx
+- src/styles.css
+- README.md
+
+Verification during initial implementation on Nov 4 (superseded by current
+totals below):
+- Frontend: npm test passed, 25 tests across 6 files at that point.
+- Frontend: npm run build passed (TypeScript plus Vite production/PWA build).
+- Server: npm test passed, 9 tests total (5 agent tests and 4 rent-order
+  tests); node --check passed for server/rent-agent.js and server/index.js.
+- Agent tests cover deterministic ranking and forced amounts, no-model empty
+  result, omitted and paid tenant handling, model failure fallback, malformed
+  snapshots, and duplicate tenant IDs.
+- Gemini and the PayPal buyer flow were subsequently tested live in the Nov 5
+  local rehearsal documented in section 15.
+
+Current code verification (Nov 5):
+- Frontend: 29 tests passed across 6 test files.
+- Frontend: `npm run build` passed (TypeScript and Vite/PWA build).
+- Server: 9 Node tests passed.
+- Firestore rules deployed after replacing the unsupported `substring` call
+  with supported `split` comparisons. Emulator tests remain unrun because
+  Java is unavailable.
+
+
+13. FOLLOW-UP POLISH AND FIREBASE SYNC REPAIR
+=============================================
+
+The later verification exposed one outstanding Firebase queue error:
+"Multiple cloud rooms have the same floor and room labels." This is a legacy
+Firestore data conflict, unrelated to Gemini or PayPal. Duplicate cloud room
+documents are retained; no data is deleted.
+
+Fix:
+- Tenant synchronization now chooses one matching active cloud room
+  deterministically: highest capacity first, then stable document ID.
+- Duplicate document IDs and the chosen canonical ID are logged with a
+  warning; duplicate records are not automatically merged or deleted.
+- Previously failed tenant queue entries with this exact duplicate-room error
+  are automatically made retryable when sync runs again.
+- Permission-denied failures now retain the sync phase (room lookup, occupant
+  read, tenant/room transaction, or record write) and error code in Settings,
+  replacing the previous overly generic message. This is intended to identify
+  the remaining Firestore rule mismatch if a retry still fails.
+- When synchronizing legacy tenant data, sync now preserves cloud `createdAt`
+  and existing non-empty `rentHistory` if older local data omits them, and
+  drops an empty `rentHistory` array that Firestore rules reject. It does not
+  alter a non-empty local rent history or invent financial history.
+- README documents the non-destructive behavior and recommends separately
+  cleaning duplicate room records in Firestore when convenient.
+
+The first retry after canonical-room selection showed a generic Firestore
+rejection for the tenant transaction and its dependent payment. The deployed
+rules file contained an unsupported `String.substring` call in the initial
+rent-history check. Firebase CLI emitted an invalid-function warning while
+compiling the old file; after replacing it with supported `split` comparisons,
+the rules deployed cleanly. The owner retried the tenant and reported that
+both the tenant and payment failures cleared.
+
+Also polished the demo UX:
+- PayPal return with `paypal=cancelled` now marks the matching saved order
+  CANCELLED locally, hides its stale approval link, and retains cancellation
+  when a later PayPal status refresh still reports an open order. A successful
+  COMPLETED result still wins and is recorded as before.
+- Rent Agent source labels now distinguish Gemini, rules fallback due to
+  Gemini unavailability, and rules-only no-overdue results.
+- README now states: “Agent proposes; owner requests; PayPal captures; the app
+  records only after PayPal confirms COMPLETED.”
+
+Added tests for deterministic duplicate-room selection, retrying existing
+duplicate-room failures, preserving legacy tenant history/creation metadata,
+and retaining cancellation when PayPal still reports an open order. The
+updated frontend suite (27 tests), backend suite (9 tests), and production
+build pass. Firebase CLI successfully compiled and deployed the corrected
+rules. The Firestore emulator test suite was not run because Java is not
+installed in this environment.
+
+The reported live sync failure is resolved. The duplicate room documents
+remain in Firestore; syncing uses the selected canonical active document and
+does not delete the others. They can be cleaned up separately after confirming
+which room record should remain authoritative.
+
+Payment-specific follow-up (Nov 4):
+- The tenant queue item cleared after the Firestore rules update, but one
+  dependent PayPal payment still showed permission-denied while writing the
+  payment record.
+- Payment sync now reads the linked cloud tenant and sets the payment's
+  `tenantName` to that tenant's current cloud name, matching the Firestore
+  rule that requires exact equality. It also checks required amount, month,
+  date, tenant ID, and note length and reports precise record errors without
+  weakening Firestore rules.
+- The first refreshed retry showed the payment references a tenant absent
+  from cloud storage. Payment sync now attempts to synchronize the linked
+  local tenant first (using the same room/capacity/rule validation), then
+  re-reads the cloud tenant and writes the payment with the cloud's canonical
+  tenant name. If no local tenant exists, it reports the exact missing tenant
+  ID; it does not weaken payment rules or change amounts.
+- Added tests for canonical tenant-name reconciliation, missing tenant, and
+  over-limit payment notes. Current frontend suite: 29 passing tests; server
+  suite: 9 passing tests; production build passes.
+- Live retry showed this payment references tenant ID
+  `f152cada-d3f7-4e15-b5b4-bf2677d84557`, which is absent from both local
+  tenant records and cloud storage. The owner confirmed it is not Ali's
+  payment; a separate Ali payment synced successfully. The orphan payment
+  still appears in the Payments list with the fallback name "Tenant" and
+  remains queued with a missing-linked-tenant error.
+- Do not automatically reassign this receipt to Ali, delete it, or erase local
+  data. It may represent a real capture for a former/different tenant. Match
+  the order/capture to its original tenant before restoring a tenant with the
+  original ID or deciding whether a test-only record can be safely removed.
+
+
+14. STALE PAYPAL ORDER CARD CLEANUP (NOV 4)
+==========================================
+
+- The completed PayPal order card was stored in localStorage independently
+  from the app's IndexedDB data. Erase All Local Data cleared IndexedDB but
+  did not remove this separate UI cache, so an old completed order remained
+  visible after records were erased.
+- The PWA now removes the saved order card when local data is erased, when
+  startup finds no matching tenant record for the saved order, and after a
+  fresh Rent Agent analysis completes. A completed order card remains visible
+  after payment sync as a receipt/progress confirmation until one of those
+  cleanup transitions or a new request replaces it.
+- The PWA suite (29 tests) and production build pass; server tests (9) pass.
+- Reload the local PWA to receive this fix. The stale card for a tenant no
+  longer present locally should disappear after local records load, and future
+  Erase All actions clear the saved order too.
+
+
+15. NOV 5 LOCAL LIVE REHEARSAL AND PACKAGING STATUS
+==================================================
+
+Owner profile and workspace:
+- The shared local browser was signed in to the configured owner account.
+- The attempted `?demo=1` load was against an existing non-empty Xyz workspace.
+  The seed refused to overwrite it, as designed. No existing records were
+  erased. This is not a clean Maple House/B1 verification.
+
+Rehearsal results (B2 happy path):
+- Run Rent Agent returned the `Gemini` source badge.
+- Daniel Reyes appeared #1 with $700.00; Mina Okafor appeared #2 with
+  $380.00; Leo, Priya, and Sam were excluded as paid tenants.
+- Daniel's explanation cited the snapshot's October and November rent amounts;
+  the reminder was factual and signed with the Xyz hostel name.
+- Copy reminder displayed “Reminder copied to clipboard.”
+- Clicking Request for Daniel created the $700 Sandbox order. No order was
+  created by the agent analysis itself.
+- Buyer completed the order in full in PayPal Sandbox. Owner Sync returned
+  `COMPLETED`; received rent showed $700, Daniel's remaining balance became
+  $0, dashboard outstanding rent fell from $1,080 to $380, and Mina remained
+  the only tenant due this month.
+- Result: the local happy path passed in this existing Xyz workspace. The
+  cancellation drill was not part of this run.
+
+Sync caveat:
+- Following local payment recording, the app displayed `Offline · 4 pending
+  changes`. The PayPal Sandbox transaction and local payment write succeeded,
+  but these queued changes were not verified as uploaded to Firestore. Do not
+  equate a completed PayPal sync with successful Firebase cloud sync.
+- The older orphan payment described in section 13 remains unresolved and
+  must not be assigned to another tenant without proof of its owner.
+
+Packaging/deployment:
+- README updated with the current workflow, stack, local rehearsal result,
+  configuration names, snapshot trust limitation, duplicate-room behavior,
+  and orphan payment handling.
+- No production/judge-facing deployment, clean Maple House rehearsal,
+  Devpost submission, or final video playback has been verified yet.
+- Continue with a genuinely fresh browser profile for `?demo=1`, deploy the
+  PWA/API with exact origin settings, repeat the complete flow on deployed
+  URLs, then finish the Devpost entry and video.

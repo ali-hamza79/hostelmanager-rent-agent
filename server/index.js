@@ -2,6 +2,9 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
+import { requireOwner } from './owner-auth.js';
+import { createRentOrder, proveRentAmount, rememberCancel, syncOrder } from './rent-orders.js';
+import { analyzeRentSnapshot } from './rent-agent.js';
 
    const {
      PAYPAL_CLIENT_ID,
@@ -37,7 +40,7 @@ async function getToken() {
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-app.post('/api/orders', async (req, res) => {
+app.post('/api/orders', requireOwner, async (req, res) => {
   try {
     const { amount, tenantId = 'tenant', month = '', description = 'Hostel rent' } = req.body ?? {};
     const value = Number(amount);
@@ -65,6 +68,7 @@ app.post('/api/orders', async (req, res) => {
             experience_context: {
               brand_name: 'HostelManager',
               user_action: 'PAY_NOW',
+              payment_method_preference: 'IMMEDIATE_PAYMENT_REQUIRED',
               return_url: `${ALLOWED_ORIGIN}/?paypal=return`,
               cancel_url: `${ALLOWED_ORIGIN}/?paypal=cancel`,
             },
@@ -82,7 +86,7 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-app.post('/api/orders/:id/capture', async (req, res) => {
+app.post('/api/orders/:id/capture', requireOwner, async (req, res) => {
   try {
     const id = req.params.id;
     if (!/^[A-Z0-9]{10,25}$/i.test(id)) return res.status(400).json({ error: 'Bad order id' });
@@ -103,6 +107,72 @@ app.post('/api/orders/:id/capture', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/rent/request', requireOwner, async (req, res) => {
+  const tenant = req.body?.tenant;
+  try {
+    proveRentAmount(tenant);
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : 'Invalid tenant snapshot.' });
+  }
+
+  try {
+    const row = await createRentOrder({ tenant, hostelName: req.body?.hostelName });
+    return res.status(201).json(row);
+  } catch (error) {
+    console.error('PayPal rent order creation failed:', error);
+    return res.status(502).json({ error: error instanceof Error ? error.message : 'Could not create the PayPal order.' });
+  }
+});
+
+app.post('/api/agent/analyze', requireOwner, async (req, res) => {
+  try {
+    const result = await analyzeRentSnapshot(req.body?.snapshot);
+    return res.json(result);
+  } catch (error) {
+    if (error?.name === 'ZodError' || error instanceof Error && error.message === 'Snapshot tenant IDs must be unique.') {
+      return res.status(400).json({ error: 'Snapshot is invalid or missing.' });
+    }
+    console.error('Rent Agent analysis failed:', error);
+    return res.status(500).json({ error: 'Could not analyze the rent snapshot.' });
+  }
+});
+
+app.get('/api/paypal/return', async (req, res) => {
+  const orderId = req.query.token;
+  if (typeof orderId !== 'string') return res.status(400).send('Missing PayPal order ID.');
+  try {
+    const row = await syncOrder(orderId);
+    const destination = new URL('/', ALLOWED_ORIGIN);
+    destination.hash = 'dashboard';
+    destination.searchParams.set('paypal', row.status === 'COMPLETED' ? 'completed' : 'pending');
+    destination.searchParams.set('orderId', row.orderId);
+    return res.redirect(303, destination.toString());
+  } catch (error) {
+    console.error('PayPal return sync failed:', error);
+    return res.status(502).send('Could not confirm the PayPal payment. Contact the hostel owner before retrying.');
+  }
+});
+
+app.get('/api/paypal/cancel', (req, res) => {
+  const orderId = req.query.token;
+  if (typeof orderId !== 'string') return res.status(400).send('Missing PayPal order ID.');
+  rememberCancel(orderId);
+  const destination = new URL('/', ALLOWED_ORIGIN);
+  destination.hash = 'dashboard';
+  destination.searchParams.set('paypal', 'cancelled');
+  destination.searchParams.set('orderId', orderId);
+  return res.redirect(303, destination.toString());
+});
+
+app.post('/api/rent/orders/:orderId/sync', requireOwner, async (req, res) => {
+  try {
+    return res.json(await syncOrder(req.params.orderId));
+  } catch (error) {
+    console.error('PayPal order sync failed:', error);
+    return res.status(502).json({ error: error instanceof Error ? error.message : 'Could not sync the PayPal order.' });
   }
 });
 

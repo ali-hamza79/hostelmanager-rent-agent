@@ -28,9 +28,29 @@ import { getSyncSettings, SyncStoreName } from './services/sync';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Onboarding } from './screens/Onboarding';
 import { restoreRecord } from './db/repo';
+import { seedDemoData } from './demo/seed';
+import { requestRentOrder, syncRentOrder, type RentOrderResult } from './agent/rentOrders';
+import { buildSnapshot } from './agent/snapshot';
+import { analyzeRentAgent, type RentAgentResult } from './agent/rentAgent';
 import type { User } from 'firebase/auth';
 
-const currency = new Intl.NumberFormat('en-PK', { style: 'currency', currency: 'PKR', maximumFractionDigits: 2 });
+const currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+const rentOrderStorageKey = 'hostel-manager-rent-order';
+
+function readSavedRentOrder(): RentOrderResult | null {
+  try {
+    const stored = localStorage.getItem(rentOrderStorageKey);
+    if (!stored) return null;
+    const order = JSON.parse(stored) as RentOrderResult;
+    return typeof order.orderId === 'string' && typeof order.tenantId === 'string' ? order : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearSavedRentOrder() {
+  localStorage.removeItem(rentOrderStorageKey);
+}
 
 const defaultTenant: Omit<Tenant, 'id'> = {
   name: '',
@@ -151,11 +171,22 @@ function App() {
   const localMetaRef = useRef<HostelMeta | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [toast, setToast] = useState('');
+  const [rentOrder, setRentOrder] = useState<RentOrderResult | null>(readSavedRentOrder);
+  const [rentOrderBusy, setRentOrderBusy] = useState(false);
+  const [rentOrderError, setRentOrderError] = useState('');
+  const [rentAgentBusy, setRentAgentBusy] = useState(false);
+  const [rentAgentError, setRentAgentError] = useState('');
+  const [rentAgentResult, setRentAgentResult] = useState<RentAgentResult | null>(null);
   const [formError, setFormError] = useState('');
   const [invalidField, setInvalidField] = useState('');
   const [roomSetupRequired, setRoomSetupRequired] = useState(false);
   const [lastSavedId, setLastSavedId] = useState('');
   const [undoAction, setUndoAction] = useState<{ label: string; run: () => Promise<void> } | null>(null);
+
+  useEffect(() => {
+    setRentAgentResult(null);
+    setRentAgentError('');
+  }, [firebaseUser, tenants, payments]);
 
   useEffect(() => {
     setFormError('');
@@ -265,6 +296,66 @@ function App() {
     };
     void load();
   }, [setMeta, setRoute]);
+
+  useEffect(() => {
+    if (!dataReady) return;
+    const params = new URLSearchParams(window.location.search);
+    const paypalResult = params.get('paypal');
+    if (!paypalResult) return;
+
+    if (paypalResult === 'cancelled') {
+      const cancelledOrderId = params.get('orderId');
+      if (cancelledOrderId) {
+        const savedOrder = readSavedRentOrder();
+        if (savedOrder?.orderId === cancelledOrderId && savedOrder.status !== 'COMPLETED') {
+          const cancelledOrder = { ...savedOrder, status: 'CANCELLED' };
+          localStorage.setItem(rentOrderStorageKey, JSON.stringify(cancelledOrder));
+          setRentOrder(cancelledOrder);
+        }
+      }
+      setToast('PayPal checkout cancelled. No payment was recorded.');
+    } else if (paypalResult === 'completed') {
+      setToast('PayPal confirmed payment. Sync the owner dashboard to record it.');
+    } else if (paypalResult === 'pending') {
+      setToast('PayPal has not confirmed payment. No payment was recorded.');
+    } else {
+      return;
+    }
+
+    params.delete('paypal');
+    params.delete('orderId');
+    const remainingSearch = params.toString();
+    window.history.replaceState(
+      {},
+      '',
+      `${window.location.pathname}${remainingSearch ? `?${remainingSearch}` : ''}${window.location.hash}`,
+    );
+    window.setTimeout(() => setToast(''), 5000);
+  }, [dataReady]);
+
+  useEffect(() => {
+    if (!dataReady || !rentOrder) return;
+    if (tenants.some((tenant) => tenant.id === rentOrder.tenantId)) return;
+    clearSavedRentOrder();
+    setRentOrder(null);
+  }, [dataReady, rentOrder, tenants]);
+
+  useEffect(() => {
+    if (!dataReady) return;
+    if (new URLSearchParams(window.location.search).get('demo') !== '1') return;
+    window.history.replaceState({}, '', window.location.pathname);
+    void (async () => {
+      try {
+        await seedDemoData();
+        await reloadLocalData();
+        setToast('Demo data loaded: Maple House');
+        window.setTimeout(() => setToast(''), 3000);
+      } catch (reason) {
+        setToast(reason instanceof Error ? reason.message : 'Could not load demo data.');
+        window.setTimeout(() => setToast(''), 4000);
+      }
+    })();
+  }, [dataReady]);
 
   const reloadLocalData = async () => {
     const [currentMeta, currentTenants, currentRooms, currentPayments, currentExpenses] = await Promise.all([
@@ -488,6 +579,100 @@ function App() {
     setPaymentForm({ ...defaultPayment, tenantId: '', tenantName: '' });
   };
 
+  const requestTenantRent = async (tenantId: string) => {
+    if (!meta) throw new Error('Set up the hostel profile before requesting rent.');
+    const tenantSnapshot = buildSnapshot(meta, tenants, payments).tenants.find((tenant) => tenant.tenantId === tenantId);
+    if (!tenantSnapshot || tenantSnapshot.outstandingAmount <= 0) {
+      throw new Error('This tenant has no outstanding rent to request.');
+    }
+
+    setRentOrderBusy(true);
+    setRentOrderError('');
+    try {
+      const order = await requestRentOrder(meta.name, tenantSnapshot);
+      setRentOrder(order);
+      localStorage.setItem(rentOrderStorageKey, JSON.stringify(order));
+    } finally {
+      setRentOrderBusy(false);
+    }
+  };
+
+  const runRentAgent = async () => {
+    if (!meta) throw new Error('Set up the hostel profile before running Rent Agent.');
+    setRentAgentBusy(true);
+    setRentAgentError('');
+    try {
+      const result = await analyzeRentAgent(buildSnapshot(meta, tenants, payments));
+      setRentAgentResult(result);
+      clearSavedRentOrder();
+      setRentOrder(null);
+    } finally {
+      setRentAgentBusy(false);
+    }
+  };
+
+  const copyRentReminder = async (reminder: string) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(reminder);
+      setToast('Reminder copied to clipboard.');
+      window.setTimeout(() => setToast(''), 3000);
+      return;
+    }
+    window.prompt('Copy this reminder:', reminder);
+  };
+
+  const syncTenantRent = async () => {
+    if (!rentOrder) throw new Error('There is no PayPal rent order to sync.');
+    setRentOrderBusy(true);
+    setRentOrderError('');
+    try {
+      const currentOrder = rentOrder;
+      const synced = await syncRentOrder(currentOrder.orderId);
+      if (currentOrder.status === 'CANCELLED' && !['COMPLETED', 'VOIDED'].includes(synced.status)) {
+        synced.status = 'CANCELLED';
+        synced.approveUrl = null;
+      }
+      setRentOrder(synced);
+      localStorage.setItem(rentOrderStorageKey, JSON.stringify(synced));
+      if (synced.status === 'COMPLETED') {
+        if (!synced.captureId || !synced.allocations.length) {
+          throw new Error('PayPal completed the order without a capture ID or payment allocation.');
+        }
+        const tenant = tenants.find((item) => item.id === synced.tenantId);
+        const paidOn = format(new Date(), 'yyyy-MM-dd');
+        for (const allocation of synced.allocations) {
+          const amount = Number(allocation.amount);
+          if (!Number.isFinite(amount) || amount <= 0) {
+            throw new Error('PayPal returned an invalid payment allocation.');
+          }
+          await savePayment({
+            id: `${synced.captureId}-${allocation.month}`,
+            tenantId: synced.tenantId,
+            tenantName: tenant?.name ?? synced.fullName ?? 'Tenant',
+            month: allocation.month,
+            amount,
+            date: paidOn,
+            note: `PayPal capture ${synced.captureId}. The full rent order was captured; any Pay in 4 installments are between the buyer and PayPal.`,
+            createdAt: new Date().toISOString(),
+          });
+        }
+        await reloadLocalData();
+        setToast(`PayPal payment recorded · ${formatMoney(Number(synced.amount))}`);
+        window.setTimeout(() => setToast(''), 3000);
+      }
+    } finally {
+      setRentOrderBusy(false);
+    }
+  };
+
+  const runRentAction = async (action: () => Promise<void>) => {
+    try {
+      await action();
+    } catch (reason) {
+      setRentOrderError(reason instanceof Error ? reason.message : 'The PayPal rent action failed.');
+    }
+  };
+
   const saveExpenseAction = async () => {
     const item: Expense = { ...expenseForm, id: crypto.randomUUID(), createdAt: new Date().toISOString(), amount: Number(expenseForm.amount) };
     await saveExpense(item);
@@ -499,6 +684,9 @@ function App() {
 
   const clearAllAction = async () => {
     await clearAll();
+    clearSavedRentOrder();
+    setRentOrder(null);
+    setRentOrderError('');
     setMeta(null);
     setTenants([]);
     setRooms([]);
@@ -708,6 +896,13 @@ function App() {
                       <li key={item.id}>
                         <span>{item.name}</span>
                         <strong>{formatMoney(item.amountDue)}</strong>
+                        <button
+                          className="ghost-btn"
+                          disabled={rentOrderBusy || !firebaseUser}
+                          onClick={() => void runRentAction(() => requestTenantRent(item.id))}
+                        >
+                          Request {formatMoney(item.amountDue)} from {item.name}
+                        </button>
                         {phone && <a className="ghost-btn" href={`https://wa.me/${phone}?text=${encodeURIComponent(reminder)}`} target="_blank" rel="noreferrer">WhatsApp reminder</a>}
                       </li>
                     );
@@ -715,6 +910,126 @@ function App() {
                 </ul>
               </section>
             </div>
+            <section className="panel rent-agent-panel">
+              <div className="section-heading">
+                <div>
+                  <h3>Rent Agent</h3>
+                  <p className="field-help">Prioritizes overdue rent and drafts reminders. It never sends messages or creates payments.</p>
+                </div>
+                <button
+                  className="primary-btn"
+                  disabled={rentAgentBusy || !firebaseUser}
+                  onClick={() => void runRentAgent().catch((reason) => {
+                    setRentAgentError(reason instanceof Error ? reason.message : 'Rent Agent analysis failed.');
+                  })}
+                >
+                  {rentAgentBusy ? 'Analyzing…' : 'Run Rent Agent'}
+                </button>
+              </div>
+              {!firebaseUser && <p className="field-help">Sign in with the configured hostel owner account to run Rent Agent.</p>}
+              {rentAgentError && <p className="inline-form-error" role="alert">{rentAgentError}</p>}
+              {rentAgentResult && (
+                <div className="rent-agent-results" aria-live="polite">
+                  <div className="section-heading">
+                    <p>{rentAgentResult.summary}</p>
+                    <span className={`summary-chip ${rentAgentResult.source === 'gemini' ? 'brand' : 'muted'}`}>
+                      {rentAgentResult.source === 'gemini'
+                        ? 'Gemini'
+                        : rentAgentResult.source === 'rules_fallback'
+                          ? 'Rules fallback · Gemini unavailable'
+                          : 'Rules · No overdue rent'}
+                    </span>
+                  </div>
+                  {rentAgentResult.warning && <p className="field-help" role="status">{rentAgentResult.warning}</p>}
+                  {rentAgentResult.cases.length === 0
+                    ? <p className="field-help">No overdue tenants were found in this snapshot.</p>
+                    : rentAgentResult.cases.map((agentCase) => {
+                      const tenant = tenants.find((item) => item.id === agentCase.tenantId);
+                      return (
+                        <article className="rent-agent-card" key={agentCase.tenantId}>
+                          <div className="section-heading">
+                            <h4>#{agentCase.rank} · {tenant?.name ?? agentCase.tenantId}</h4>
+                            <strong>{formatMoney(Number(agentCase.proposedAction.amount))}</strong>
+                          </div>
+                          <p>{agentCase.explanation}</p>
+                          <blockquote>{agentCase.draftReminder}</blockquote>
+                          <div className="rent-agent-actions">
+                            <button
+                              className="ghost-btn"
+                              onClick={() => void copyRentReminder(agentCase.draftReminder).catch((reason) => {
+                                setRentAgentError(reason instanceof Error ? reason.message : 'Could not copy the reminder.');
+                              })}
+                            >
+                              Copy reminder
+                            </button>
+                            <button
+                              className="ghost-btn"
+                              disabled={rentOrderBusy || !firebaseUser}
+                              onClick={() => void runRentAction(() => requestTenantRent(agentCase.tenantId))}
+                            >
+                              Request {formatMoney(Number(agentCase.proposedAction.amount))} from {tenant?.name ?? 'tenant'}
+                            </button>
+                          </div>
+                        </article>
+                      );
+                    })}
+                </div>
+              )}
+            </section>
+            {rentOrderError && <p className="inline-form-error" role="alert">{rentOrderError}</p>}
+            {!firebaseUser && unpaid.length > 0 && <p className="field-help">Sign in with the configured hostel owner account to request PayPal rent.</p>}
+            {rentOrder && (
+              <section className="panel form-panel" aria-live="polite">
+                <div className="section-heading">
+                  <h3>PayPal rent request · {rentOrder.fullName ?? 'Tenant'}</h3>
+                  <span className={`summary-chip ${rentOrder.status === 'COMPLETED' ? 'success' : 'warning'}`}>{rentOrder.status}</span>
+                </div>
+                {(() => {
+                  const total = Number(rentOrder.amount);
+                  const validTotal = Number.isFinite(total) && total > 0 ? total : 0;
+                  const received = rentOrder.status === 'COMPLETED' ? validTotal : 0;
+                  const remaining = Math.max(0, validTotal - received);
+                  const progress = validTotal > 0 ? Math.round((received / validTotal) * 100) : 0;
+
+                  return (
+                    <div className="rent-payment-progress">
+                      <p className="muted-copy">{formatMoney(validTotal)} USD · Order {rentOrder.orderId}</p>
+                      <div className="rent-payment-progress-labels">
+                        <span><small>Received by hostel</small><strong>{formatMoney(received)}</strong></span>
+                        <span><small>Rent remaining</small><strong>{formatMoney(remaining)}</strong></span>
+                        <span><small>Rent requested</small><strong>{formatMoney(validTotal)}</strong></span>
+                      </div>
+                      <div
+                        className="rent-progress-track"
+                        role="progressbar"
+                        aria-label={`Rent payment progress: ${formatMoney(received)} received of ${formatMoney(validTotal)}`}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={progress}
+                      >
+                        <div className="rent-progress-fill" style={{ width: `${progress}%` }} />
+                      </div>
+                      {rentOrder.status === 'COMPLETED'
+                        ? <p className="field-help">PayPal confirmed the full order was paid to the hostel. Pay in 4, if selected, is a separate repayment plan between the tenant and PayPal.</p>
+                        : <p className="field-help">No amount is counted as received until PayPal confirms the order is COMPLETED.</p>}
+                    </div>
+                  );
+                })()}
+                {rentOrder.approveUrl && !['COMPLETED', 'CANCELLED', 'VOIDED'].includes(rentOrder.status) && (
+                  <a className="primary-btn" href={rentOrder.approveUrl} target="_blank" rel="noreferrer">
+                    Open PayPal approval in tenant browser
+                  </a>
+                )}
+                <button
+                  className="ghost-btn"
+                  disabled={rentOrderBusy || !firebaseUser}
+                  onClick={() => void runRentAction(syncTenantRent)}
+                >
+                  {rentOrderBusy ? 'Syncing…' : rentOrder.status === 'CANCELLED' ? 'Refresh PayPal status' : 'Sync with PayPal'}
+                </button>
+                {rentOrderError && <p className="inline-form-error" role="alert">{rentOrderError}</p>}
+              </section>
+            )}
           </div>
         )}
 

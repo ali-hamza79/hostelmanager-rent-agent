@@ -94,6 +94,24 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 .summary-chip.success, .status-chip.success { color: #087443; background: #dcfce7; }
 .summary-chip.warning, .status-chip.warning { color: #955600; background: #fef3c7; }
 .summary-chip.muted, .status-chip.muted { color: #64748b; background: #e2e8f0; }
+.rent-payment-progress { display: grid; gap: 12px; margin: 0 0 14px; }
+.rent-payment-progress > .muted-copy, .rent-payment-progress > .field-help { margin: 0; }
+.rent-payment-progress-labels { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.rent-payment-progress-labels span { display: grid; gap: 4px; }
+.rent-payment-progress-labels small { color: var(--muted); font-size: 0.78rem; }
+.rent-payment-progress-labels strong { font-size: 1rem; }
+.rent-agent-panel { display: grid; gap: 16px; }
+.rent-agent-panel .section-heading > div { min-width: 0; }
+.rent-agent-panel .section-heading p { margin: 4px 0 0; }
+.rent-agent-results { display: grid; gap: 12px; }
+.rent-agent-results > .section-heading p { margin: 0; }
+.rent-agent-card { display: grid; gap: 10px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; }
+.rent-agent-card .section-heading { margin: 0; }
+.rent-agent-card h4, .rent-agent-card p, .rent-agent-card blockquote { margin: 0; }
+.rent-agent-card blockquote { padding: 12px; border-left: 3px solid var(--brand); background: var(--bg); }
+.rent-agent-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.rent-progress-track { height: 12px; overflow: hidden; border-radius: 999px; background: #e2e8f0; }
+.rent-progress-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, #19a876, #25c18a); transition: width 180ms ease; }
 .form-step { margin-left: 8px; color: var(--muted); font-size: 0.75rem; font-weight: 500; }
 .field-group-title { grid-column: 1 / -1; margin-top: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--line); color: var(--text); font-size: 0.82rem; font-weight: 750; letter-spacing: 0.03em; text-transform: uppercase; }
 .inline-link { align-self: flex-start; min-height: 36px; border: 0; padding: 4px 0; background: transparent; color: var(--brand-strong); font-weight: 700; text-align: left; text-decoration: underline; text-underline-offset: 3px; }

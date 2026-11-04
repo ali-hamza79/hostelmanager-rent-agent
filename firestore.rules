@@ -42,7 +42,8 @@ service cloud.firestore {
           && data.rentHistory[0] is map
           && data.rentHistory[0].keys().hasAll(['effectiveMonth', 'amount'])
           && validMonth(data.rentHistory[0].effectiveMonth)
-          && data.rentHistory[0].effectiveMonth == data.joinDate.substring(0, 7)
+          && data.rentHistory[0].effectiveMonth.split('-')[0] == data.joinDate.split('-')[0]
+          && data.rentHistory[0].effectiveMonth.split('-')[1] == data.joinDate.split('-')[1]
           && validAmount(data.rentHistory[0].amount)
           && data.rentHistory[data.rentHistory.size() - 1] is map
           && data.rentHistory[data.rentHistory.size() - 1].keys().hasAll(['effectiveMonth', 'amount'])

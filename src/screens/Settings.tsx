@@ -242,7 +242,7 @@ export function Settings({
             <ul className="list-stack tight">
               {failedItems.map((item) => (
                 <li key={item.id}>
-                  <span>{item.store.slice(0, -1)} · {item.payload.id}: {item.lastError}</span>
+                  <span>{item.store.slice(0, -1)} · {item.payload.id}: {item.lastError}{item.lastErrorCode ? ` (${item.lastErrorCode})` : ''}</span>
                   <button type="button" className="ghost-btn" onClick={() => void retryFailure(item)} disabled={busy}>Retry</button>
                 </li>
               ))}

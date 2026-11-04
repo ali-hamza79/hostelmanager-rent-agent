@@ -2,6 +2,12 @@ import { IDBPTransaction } from 'idb';
 import type { DocumentData } from 'firebase/firestore';
 import { dbPromise } from '../db/idb';
 import type { SyncSettings } from '../types';
+import {
+  chooseCanonicalCloudRoom,
+  DUPLICATE_CLOUD_ROOM_SYNC_ERROR,
+  LEGACY_ROOM_SYNC_ERROR,
+  reconcileRoomOccupants,
+} from './roomOccupancy';
 
 export type SyncStoreName = 'tenants' | 'rooms' | 'payments' | 'expenses';
 export type SyncAction = 'upsert' | 'delete';
@@ -186,6 +192,153 @@ async function updatePendingCount() {
   publish({ pending: queue.length, failed: queue.filter((item) => item.failed).length });
 }
 
+export async function repairLegacyDemoSyncItems(db: Awaited<typeof dbPromise>) {
+  const tx = db.transaction(['tenants', 'syncQueue'], 'readwrite');
+  const tenantStore = tx.objectStore('tenants');
+  const queueStore = tx.objectStore('syncQueue');
+  const [tenants, queue] = await Promise.all([tenantStore.getAll(), queueStore.getAll()]) as [
+    Array<Record<string, unknown> & { id: string }>,
+    SyncQueueItem[],
+  ];
+  const repairedTenantIds = new Set<string>();
+  const now = new Date().toISOString();
+
+  for (const item of queue) {
+    if (item.store === 'tenants'
+      && item.payload.id.startsWith('demo-')
+      && item.payload.mess === 'Standard Mess') {
+      repairedTenantIds.add(item.payload.id);
+    }
+  }
+
+  for (const tenant of tenants) {
+    if (tenant.id.startsWith('demo-') && tenant.mess === 'Standard Mess') {
+      await tenantStore.put({ ...tenant, mess: 'Standard', updatedAt: now });
+      repairedTenantIds.add(tenant.id);
+    }
+  }
+
+  let repairedQueueCount = 0;
+  for (const item of queue) {
+    const isLegacyDemoTenant = item.store === 'tenants'
+      && item.payload.id.startsWith('demo-')
+      && item.payload.mess === 'Standard Mess';
+    const isDependentDemoPayment = item.store === 'payments'
+      && typeof item.payload.tenantId === 'string'
+      && item.payload.tenantId.startsWith('demo-')
+      && repairedTenantIds.has(item.payload.tenantId);
+    if (!isLegacyDemoTenant && !isDependentDemoPayment) continue;
+
+    const { lastError: _lastError, lastErrorCode: _lastErrorCode, ...retryable } = item;
+    await queueStore.put({
+      ...retryable,
+      payload: isLegacyDemoTenant
+        ? { ...item.payload, mess: 'Standard', updatedAt: now }
+        : item.payload,
+      failed: false,
+      attempts: 0,
+      nextAttemptAt: now,
+    });
+    repairedQueueCount += 1;
+  }
+
+  await tx.done;
+  return repairedQueueCount;
+}
+
+export async function retryLegacyRoomCapacityFailures(db: Awaited<typeof dbPromise>) {
+  const queue = await db.getAll('syncQueue') as SyncQueueItem[];
+  const now = new Date().toISOString();
+  let repairedCount = 0;
+  for (const item of queue) {
+    if (item.store !== 'tenants' || !item.failed || item.lastError !== LEGACY_ROOM_SYNC_ERROR) continue;
+    const { lastError: _lastError, lastErrorCode: _lastErrorCode, ...retryable } = item;
+    await db.put('syncQueue', {
+      ...retryable,
+      failed: false,
+      attempts: 0,
+      nextAttemptAt: now,
+    });
+    repairedCount += 1;
+  }
+  return repairedCount;
+}
+
+export async function retryDuplicateCloudRoomFailures(db: Awaited<typeof dbPromise>) {
+  const queue = await db.getAll('syncQueue') as SyncQueueItem[];
+  const now = new Date().toISOString();
+  let repairedCount = 0;
+  for (const item of queue) {
+    if (item.store !== 'tenants' || !item.failed || item.lastError !== DUPLICATE_CLOUD_ROOM_SYNC_ERROR) continue;
+    const { lastError: _lastError, lastErrorCode: _lastErrorCode, ...retryable } = item;
+    await db.put('syncQueue', {
+      ...retryable,
+      failed: false,
+      attempts: 0,
+      nextAttemptAt: now,
+    });
+    repairedCount += 1;
+  }
+  return repairedCount;
+}
+
+export function prepareTenantSyncRecord(
+  localData: Record<string, unknown>,
+  cloudData?: Record<string, unknown>,
+) {
+  const record = { ...localData };
+  if (typeof record.createdAt !== 'string' && typeof cloudData?.createdAt === 'string') {
+    record.createdAt = cloudData.createdAt;
+  }
+  if (!Array.isArray(record.rentHistory) || record.rentHistory.length === 0) {
+    if (Array.isArray(cloudData?.rentHistory) && cloudData.rentHistory.length > 0) {
+      record.rentHistory = cloudData.rentHistory;
+    } else {
+      delete record.rentHistory;
+    }
+  }
+  return record;
+}
+
+export function preparePaymentSyncRecord(
+  localData: Record<string, unknown>,
+  cloudTenant: Record<string, unknown> | undefined,
+) {
+  const invalidPayment = (message: string, code = 'invalid-argument') => {
+    const error = new Error(message) as Error & { code?: string };
+    error.code = code;
+    return error;
+  };
+  if (!cloudTenant) {
+    const tenantId = typeof localData.tenantId === 'string' ? localData.tenantId : '(missing)';
+    throw invalidPayment(
+      `Cannot sync this payment because tenant ${tenantId} is not in cloud storage and has no local tenant record to sync.`,
+      'failed-precondition',
+    );
+  }
+  if (typeof cloudTenant.name !== 'string' || cloudTenant.name.length > 120) {
+    throw invalidPayment('Cannot sync this payment because the cloud tenant name is missing or invalid.', 'failed-precondition');
+  }
+
+  const record: Record<string, unknown> = { ...localData, tenantName: cloudTenant.name };
+  if (typeof record.tenantId !== 'string' || !record.tenantId.length) {
+    throw invalidPayment('Cannot sync this payment because its tenant ID is missing.');
+  }
+  if (typeof record.amount !== 'number' || !Number.isFinite(record.amount) || record.amount <= 0 || record.amount > 100000000) {
+    throw invalidPayment('Cannot sync this payment because its amount is invalid.');
+  }
+  if (typeof record.month !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(record.month)) {
+    throw invalidPayment('Cannot sync this payment because its month must use YYYY-MM format.');
+  }
+  if (typeof record.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(record.date)) {
+    throw invalidPayment('Cannot sync this payment because its date must use YYYY-MM-DD format.');
+  }
+  if (typeof record.note !== 'string' || record.note.length > 500) {
+    throw invalidPayment('Cannot sync this payment because its note exceeds the 500-character limit.');
+  }
+  return record;
+}
+
 function payloadTimestamp(payload: Record<string, unknown>, fallback: string) {
   const value = typeof payload.updatedAt === 'string'
     ? payload.updatedAt
@@ -236,11 +389,29 @@ async function remoteRef(store: SyncStoreName, id: string) {
   return doc(firestore, 'hostels', user.uid, collectionNames[store], id);
 }
 
+function addSyncPhase(error: unknown, phase: string) {
+  const message = error instanceof Error ? error.message : 'Cloud sync failed.';
+  const wrapped = new Error(message) as Error & { code?: string; syncPhase?: string };
+  if (typeof error === 'object' && error !== null && 'code' in error) {
+    wrapped.code = String(error.code);
+  }
+  wrapped.syncPhase = phase;
+  return wrapped;
+}
+
+async function withSyncPhase<T>(phase: string, operation: () => Promise<T>) {
+  try {
+    return await operation();
+  } catch (error) {
+    throw addSyncPhase(error, phase);
+  }
+}
+
 async function processItem(item: SyncQueueItem) {
   const { collection, doc, getDoc, getDocs, query, runTransaction, setDoc, where } =
     await import('firebase/firestore');
-  const ref = await remoteRef(item.store, item.payload.id);
-  const remote = await getDoc(ref);
+  const ref = await withSyncPhase('opening the cloud record', () => remoteRef(item.store, item.payload.id));
+  const remote = await withSyncPhase('reading the cloud record', () => getDoc(ref));
   if (remote.exists()) {
     const remoteData = remote.data();
     const cloudTime = remoteTimestamp(remoteData);
@@ -284,13 +455,21 @@ async function processItem(item: SyncQueueItem) {
         where('floor', '==', floor),
         where('room', '==', roomName),
       );
-      const rooms = await getDocs(roomQuery);
-      if (rooms.docs.length > 1) {
-        const duplicateError = new Error('Multiple cloud rooms have the same floor and room labels.') as Error & { code?: string };
-        duplicateError.code = 'failed-precondition';
-        throw duplicateError;
+      const rooms = await withSyncPhase('resolving room labels and existing occupancy', () => getDocs(roomQuery));
+      if (rooms.docs.length === 0) return doc(firestore, 'hostels', user.uid, 'Rooms', `${floor}_${roomName}`);
+      const candidates = rooms.docs.map((room) => ({
+        id: room.id,
+        capacity: room.data().capacity,
+        deletedAt: room.data().deletedAt,
+        ref: room.ref,
+      }));
+      const canonical = chooseCanonicalCloudRoom(candidates);
+      if (candidates.length > 1) {
+        console.warn(
+          `Found ${candidates.length} cloud room records for floor ${floor}, room ${roomName}; syncing against ${canonical.id}. Duplicates were retained.`,
+        );
       }
-      return rooms.docs[0]?.ref ?? doc(firestore, 'hostels', user.uid, 'Rooms', `${floor}_${roomName}`);
+      return canonical.ref;
     };
     const newRoomRef = await findRoomRef(nextFloor, nextRoomName);
     const previousRoomRef = oldTenantData
@@ -310,7 +489,7 @@ async function processItem(item: SyncQueueItem) {
         where('room', '==', roomLabels.room),
         where('status', '==', 'Active'),
       );
-      const snapshot = await getDocs(tenantQuery);
+      const snapshot = await withSyncPhase('reading existing room occupants', () => getDocs(tenantQuery));
       legacyOccupants.set(roomKey, snapshot.docs
         .filter((entry) => !entry.data().deletedAt)
         .map((entry) => entry.id));
@@ -318,21 +497,53 @@ async function processItem(item: SyncQueueItem) {
     const oldRoomRef = oldRoom && oldRoom !== nextRoom
       ? previousRoomRef
       : null;
-    const outcome = await runTransaction(firestore, async (transaction) => {
+    const outcome = await withSyncPhase('checking room capacity and writing the tenant/room transaction', () =>
+      runTransaction(firestore, async (transaction) => {
       const currentTenant = await transaction.get(ref);
       if (currentTenant.exists() && remoteTimestamp(currentTenant.data()) > payloadTimestamp(item.payload, item.createdAt)) {
         return { stale: true, data: currentTenant.data() };
       }
+      const tenantData = prepareTenantSyncRecord(
+        data,
+        currentTenant.exists() ? currentTenant.data() : undefined,
+      );
       const newRoomSnapshot = await transaction.get(newRoomRef);
       const oldRoomSnapshot = oldRoomRef ? await transaction.get(oldRoomRef) : null;
       if (!newRoomSnapshot.exists() || newRoomSnapshot.data().deletedAt) {
-        throw new Error('Register this room before assigning an active tenant.');
+        const roomError = new Error(`Room ${nextFloor}-${nextRoomName} is missing or deleted in cloud storage. Sync or register the room before retrying.`) as Error & { code?: string };
+        roomError.code = 'room-unavailable';
+        throw roomError;
       }
-      const active = data.status === 'Active' && !data.deletedAt;
+      const active = tenantData.status === 'Active' && !tenantData.deletedAt;
       const nextRoomData = newRoomSnapshot.data();
-      let nextOccupants = Array.isArray(nextRoomData.occupiedTenantIds)
-        ? [...nextRoomData.occupiedTenantIds as string[]]
-        : [...(legacyOccupants.get(nextRoom) ?? [])];
+      const readRoomOccupants = async (
+        roomData: DocumentData,
+        fallbackIds: string[],
+        floor: string,
+        roomName: string,
+      ) => {
+        const storedIds = Array.isArray(roomData.occupiedTenantIds)
+          ? roomData.occupiedTenantIds.filter((id: unknown): id is string => typeof id === 'string')
+          : [];
+        const candidates = [...new Set([...storedIds, ...fallbackIds])];
+        const records = [];
+        for (const id of candidates) {
+          if (id === tenantId && currentTenant.exists()) {
+            records.push({ id, ...currentTenant.data() });
+            continue;
+          }
+          const occupant = await transaction.get(doc(firestore, 'hostels', user.uid, 'Tenants', id));
+          if (occupant.exists()) records.push({ id, ...occupant.data() });
+        }
+        return reconcileRoomOccupants(storedIds, records, floor, roomName);
+      };
+
+      let nextOccupants = await readRoomOccupants(
+        nextRoomData,
+        legacyOccupants.get(nextRoom) ?? [],
+        nextFloor,
+        nextRoomName,
+      );
       const wasInTarget = nextOccupants.includes(tenantId);
       const previousTenant = currentTenant.exists() ? currentTenant.data() : null;
       const previousActive = previousTenant?.status === 'Active' && !previousTenant.deletedAt;
@@ -340,15 +551,20 @@ async function processItem(item: SyncQueueItem) {
         ? `${String(previousTenant.floor)}_${String(previousTenant.room)}`
         : null;
       if (active && !wasInTarget && nextOccupants.length >= Number(nextRoomData.capacity)) {
-        const capacityError = new Error('This room has reached its registered bed capacity.') as Error & { code?: string };
-        capacityError.code = 'failed-precondition';
+        const capacityError = new Error(
+          `Room ${nextFloor}-${nextRoomName} is full (${nextOccupants.length}/${Number(nextRoomData.capacity)} beds). Assign the tenant to an available room or increase the registered capacity.`,
+        ) as Error & { code?: string };
+        capacityError.code = 'room-capacity-exceeded';
         throw capacityError;
       }
-      if (oldRoomSnapshot?.exists() && previousRoom && previousRoom !== nextRoom) {
+      if (oldRoomSnapshot?.exists() && previousRoom && previousRoom !== nextRoom && oldTenantData) {
         const oldData = oldRoomSnapshot.data();
-        const oldOccupants = Array.isArray(oldData.occupiedTenantIds)
-          ? [...oldData.occupiedTenantIds as string[]]
-          : [...(legacyOccupants.get(previousRoom) ?? [])];
+        const oldOccupants = await readRoomOccupants(
+          oldData,
+          legacyOccupants.get(previousRoom) ?? [],
+          String(oldTenantData.floor),
+          String(oldTenantData.room),
+        );
         await transaction.set(oldRoomRef!, {
           occupiedTenantIds: oldOccupants.filter((id) => id !== tenantId),
           updatedAt: new Date().toISOString(),
@@ -363,17 +579,47 @@ async function processItem(item: SyncQueueItem) {
           updatedAt: new Date().toISOString(),
         }, { merge: true });
       }
-      await transaction.set(ref, data);
+      await transaction.set(ref, tenantData);
       return { stale: false, data: null };
-    });
+      }),
+    );
     if (outcome.stale && outcome.data) await applyRemote(item.store, tenantId, outcome.data);
     return;
   }
   if (item.store === 'rooms') {
-    await setDoc(ref, data, { merge: true });
+    await withSyncPhase('writing the room record', () => setDoc(ref, data, { merge: true }));
     return;
   }
-  await setDoc(ref, data);
+  if (item.store === 'payments') {
+    const tenantId = typeof data.tenantId === 'string' ? data.tenantId : '';
+    if (!tenantId) throw new Error('Cannot sync this payment because its tenant ID is missing.');
+    const tenantRef = await remoteRef('tenants', tenantId);
+    let tenantSnapshot = await withSyncPhase('reading the linked cloud tenant', () => getDoc(tenantRef));
+    if (!tenantSnapshot.exists()) {
+      const db = await dbPromise;
+      const localTenant = await db.get('tenants', tenantId) as (Record<string, unknown> & { id: string }) | undefined;
+      if (localTenant) {
+        await processItem({
+          id: `payment-prerequisite-${tenantId}`,
+          action: 'upsert',
+          store: 'tenants',
+          payload: localTenant,
+          createdAt: typeof localTenant.updatedAt === 'string' ? localTenant.updatedAt : new Date().toISOString(),
+          sequence: 0,
+          attempts: 0,
+          nextAttemptAt: new Date().toISOString(),
+        });
+        tenantSnapshot = await withSyncPhase('verifying the linked tenant after prerequisite sync', () => getDoc(tenantRef));
+      }
+    }
+    const paymentData = preparePaymentSyncRecord(
+      data,
+      tenantSnapshot.exists() ? tenantSnapshot.data() : undefined,
+    );
+    await withSyncPhase('writing the payment record', () => setDoc(ref, paymentData));
+    return;
+  }
+  await withSyncPhase(`writing the ${item.store.slice(0, -1)} record`, () => setDoc(ref, data));
 }
 
 function scheduleRetry(delayMs: number) {
@@ -412,6 +658,9 @@ export async function processSyncQueue() {
   publish({ status: 'syncing', error: undefined });
   try {
     const db = await dbPromise;
+    await repairLegacyDemoSyncItems(db);
+    await retryLegacyRoomCapacityFailures(db);
+    await retryDuplicateCloudRoomFailures(db);
     while (true) {
       const currentSettings = await getSyncSettings();
       if (!currentSettings?.enabled) {
@@ -448,19 +697,26 @@ export async function processSyncQueue() {
           ? String((error as { code?: unknown }).code ?? '').toLowerCase()
           : '';
         const message = error instanceof Error ? error.message : 'Cloud sync failed.';
+        const syncPhase = error && typeof error === 'object' && 'syncPhase' in error
+          ? String((error as { syncPhase?: unknown }).syncPhase ?? '')
+          : '';
         const permanent = code.includes('permission-denied')
           || code.includes('invalid-argument')
           || code.includes('failed-precondition')
+          || code.includes('room-capacity-exceeded')
+          || code.includes('room-unavailable')
           || /PERMISSION_DENIED|INVALID_ARGUMENT/.test(message);
         if (permanent) {
           await db.put('syncQueue', {
             ...item,
             failed: true,
             lastErrorCode: code || (message.includes('PERMISSION_DENIED') ? 'permission-denied' : 'invalid-argument'),
-            lastError: code.includes('failed-precondition')
-              ? 'This room is full or unavailable. Change the tenant assignment or increase room capacity before retrying.'
+            lastError: code.includes('room-capacity-exceeded') || code.includes('room-unavailable')
+              ? message
+              : code.includes('failed-precondition')
+              ? message
               : code.includes('permission-denied') || message.includes('PERMISSION_DENIED')
-              ? 'Firestore rejected this record. Check the record fields and security rules.'
+              ? `Firestore rejected this record${syncPhase ? ` while ${syncPhase}` : ''}. Check the deployed rules and the relevant record fields.`
               : 'Firestore rejected this record as invalid. Check its fields and limits.',
           });
           await updatePendingCount();

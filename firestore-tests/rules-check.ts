@@ -6,7 +6,7 @@ import {
   assertSucceeds,
   initializeTestEnvironment,
 } from '@firebase/rules-unit-testing';
-import { deleteDoc, doc, setDoc, updateDoc } from 'firebase/firestore';
+import { deleteDoc, doc, runTransaction, setDoc, updateDoc } from 'firebase/firestore';
 
 const uid = 'hostel-owner';
 const hostelPath = `hostels/${uid}`;
@@ -93,6 +93,38 @@ describe.skipIf(!emulatorAvailable)('Firestore record rules', () => {
       tenantName: 'Ali & Sons Hostel',
       note: 'updated note',
       updatedAt: timestamp,
+    }));
+  });
+
+  it('allows the tenant and its room occupancy to sync in one transaction', async () => {
+    const firestore = environment.authenticatedContext(uid).firestore();
+    const tenantRef = doc(firestore, hostelPath, 'Tenants', 'tenant-room-transaction');
+    const roomRef = doc(firestore, hostelPath, 'Rooms', '1_A-1');
+    await environment.withSecurityRulesDisabled(async (context) => {
+      const adminDb = context.firestore();
+      await setDoc(tenantRef, tenantRecord());
+      await setDoc(roomRef, {
+        floor: '1',
+        room: 'A-1',
+        capacity: 2,
+        occupiedTenantIds: [],
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+    });
+
+    await assertSucceeds(runTransaction(firestore, async (transaction) => {
+      await transaction.get(tenantRef);
+      await transaction.get(roomRef);
+      transaction.set(roomRef, {
+        floor: '1',
+        room: 'A-1',
+        capacity: 2,
+        occupiedTenantIds: ['tenant-room-transaction'],
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+      transaction.set(tenantRef, tenantRecord('Ali Revised'));
     }));
   });
 });
