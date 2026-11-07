@@ -75,4 +75,26 @@ describe('buildSnapshot', () => {
       monthsOverdue: 0,
     });
   });
+
+  it('includes all four unpaid months so rent requests reconcile to the total balance', () => {
+    const fourMonthsAgo = format(subMonths(asOf, 3), 'yyyy-MM');
+    const fourMonthTenant: Tenant = {
+      ...tenant('four-months', 'Four Month Tenant', 350),
+      joinDate: `${fourMonthsAgo}-01`,
+      billingStartDate: fourMonthsAgo,
+      rentHistory: [{ effectiveMonth: fourMonthsAgo, amount: 350 }],
+    };
+
+    const result = buildSnapshot(
+      { name: 'Maple House', address: 'Demo property', createdAt: asOf.toISOString() },
+      [fourMonthTenant],
+      [],
+    ).tenants[0]!;
+
+    expect(result.monthsOverdue).toBe(4);
+    expect(result.outstandingAmount).toBe(1400);
+    expect(result.recentMonths).toHaveLength(3);
+    expect(result.paymentMonths).toHaveLength(4);
+    expect(result.paymentMonths.reduce((total, month) => total + month.outstandingAmount, 0)).toBe(1400);
+  });
 });

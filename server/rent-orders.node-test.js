@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
-import { requireOwner } from './owner-auth.js';
+import { createRequireOwner, requireOwner } from './owner-auth.js';
+import { createRentOrderSyncHandler } from './rent-order-handlers.js';
 import { createRentOrder, proveRentAmount, rememberCancel, syncOrder } from './rent-orders.js';
+import { paypal } from './paypal.js';
 
 const tenant = {
   tenantId: 'demo-daniel-reyes',
@@ -42,6 +44,73 @@ describe('rent order safety and idempotency', () => {
     assert.throws(() => proveRentAmount({ ...tenant, outstandingAmount: 1 }), /does not match/);
   });
 
+  it('proves a balance spanning four overdue months', () => {
+    const fourMonthTenant = {
+      ...tenant,
+      outstandingAmount: 1400,
+      paymentMonths: ['2026-08', '2026-09', '2026-10', '2026-11'].map((month) => ({
+        month,
+        rentDue: 350,
+        amountPaid: 0,
+      })),
+    };
+
+    const proof = proveRentAmount(fourMonthTenant);
+
+    assert.equal(proof.amount, 1400);
+    assert.equal(proof.allocations.length, 4);
+    assert.equal(proof.allocations.reduce((total, item) => total + Number(item.amount), 0), 1400);
+  });
+
+  it('compresses eight monthly allocations into PayPal custom metadata and recovers them', async () => {
+    process.env.PAYPAL_CLIENT_ID = 'sandbox-client';
+    process.env.PAYPAL_CLIENT_SECRET = 'sandbox-secret';
+    process.env.PUBLIC_BASE_URL = 'https://rent.example.test';
+    const months = Array.from({ length: 8 }, (_, index) => {
+      const month = new Date(Date.UTC(2026, index, 1)).toISOString().slice(0, 7);
+      return { month, rentDue: 350, amountPaid: 0 };
+    });
+    const eightMonthTenant = {
+      ...tenant,
+      tenantId: 'eight-month-tenant',
+      outstandingAmount: 2800,
+      recentMonths: months,
+    };
+    let orderBody;
+    globalThis.fetch = async (input, init = {}) => {
+      const url = String(input);
+      if (url.endsWith('/v1/oauth2/token')) {
+        return new Response(JSON.stringify({ access_token: 'compressed-test-token', expires_in: 3600 }), { status: 200 });
+      }
+      if (url.endsWith('/v2/checkout/orders') && init.method === 'POST') {
+        orderBody = JSON.parse(init.body);
+        return new Response(JSON.stringify({
+          id: 'EIGHTMONTHS123',
+          status: 'CREATED',
+          links: [{ rel: 'payer-action', href: 'https://www.sandbox.paypal.com/checkoutnow?token=EIGHTMONTHS123' }],
+        }), { status: 201 });
+      }
+      if (url.endsWith('/v2/checkout/orders/EIGHTMONTHS123')) {
+        return new Response(JSON.stringify({
+          id: 'EIGHTMONTHS123',
+          ...orderBody,
+          status: 'PAYER_ACTION_REQUIRED',
+        }), { status: 200 });
+      }
+      throw new Error(`Unexpected mocked PayPal request: ${url}`);
+    };
+
+    await createRentOrder({ tenant: eightMonthTenant, hostelName: 'Maple House' });
+    const customId = orderBody.purchase_units[0].custom_id;
+    assert.ok(customId.length <= 127);
+
+    const recovered = await syncOrder('EIGHTMONTHS123');
+
+    assert.equal(recovered.amount, '2800.00');
+    assert.equal(recovered.allocations.length, 8);
+    assert.equal(recovered.allocations.reduce((total, item) => total + Number(item.amount), 0), 2800);
+  });
+
   it('rejects owner actions without a Firebase bearer token', async () => {
     let status;
     let body;
@@ -59,6 +128,91 @@ describe('rent order safety and idempotency', () => {
     await requireOwner({ get: () => undefined }, response, () => assert.fail('next must not be called'));
     assert.equal(status, 401);
     assert.equal(body.error, 'Owner sign-in required.');
+  });
+
+  it('rejects an invalid Firebase owner token', async () => {
+    let status;
+    let body;
+    const response = {
+      status(code) {
+        status = code;
+        return this;
+      },
+      json(value) {
+        body = value;
+        return this;
+      },
+    };
+    const middleware = createRequireOwner({
+      ownerUid: 'owner-uid',
+      projectId: 'hostel-project',
+      verifyToken: async () => { throw new Error('invalid token'); },
+    });
+
+    await middleware({ get: () => 'Bearer invalid-token' }, response, () => assert.fail('next must not be called'));
+
+    assert.equal(status, 401);
+    assert.equal(body.error, 'Owner sign-in token is invalid or expired.');
+  });
+
+  it('returns a valid synced order from the owner sync route handler', async () => {
+    const expected = { orderId: 'VALIDORDER123', status: 'COMPLETED', captureId: 'CAPTURE123' };
+    let responseBody;
+    const handler = createRentOrderSyncHandler(async (orderId) => {
+      assert.equal(orderId, expected.orderId);
+      return expected;
+    });
+
+    await handler({ params: { orderId: expected.orderId } }, {
+      json(value) {
+        responseBody = value;
+        return this;
+      },
+    });
+
+    assert.deepEqual(responseBody, expected);
+  });
+
+  it('returns a gateway error when PayPal sync times out', async () => {
+    let status;
+    let responseBody;
+    const handler = createRentOrderSyncHandler(async () => {
+      const error = new Error('PayPal request timed out.');
+      error.name = 'TimeoutError';
+      throw error;
+    });
+
+    await handler({ params: { orderId: 'VALIDORDER123' } }, {
+      status(code) {
+        status = code;
+        return this;
+      },
+      json(value) {
+        responseBody = value;
+        return this;
+      },
+    });
+
+    assert.equal(status, 502);
+    assert.deepEqual(responseBody, { error: 'PayPal request timed out.' });
+  });
+
+  it('aborts PayPal API requests when the network exceeds its timeout', async () => {
+    process.env.PAYPAL_CLIENT_ID = 'sandbox-client';
+    process.env.PAYPAL_CLIENT_SECRET = 'sandbox-secret';
+    let apiSignal;
+    globalThis.fetch = async (input, options = {}) => {
+      if (String(input).endsWith('/v1/oauth2/token')) {
+        return new Response(JSON.stringify({ access_token: 'timeout-test-token', expires_in: 3600 }), { status: 200 });
+      }
+      apiSignal = options.signal;
+      const error = new Error('request aborted by timeout');
+      error.name = 'TimeoutError';
+      throw error;
+    };
+
+    await assert.rejects(() => paypal('/v2/checkout/orders/TIMEOUT12345'), /PayPal request timed out/);
+    assert.ok(apiSignal instanceof AbortSignal);
   });
 
   it('reuses a pending order and recovers a completed order after server memory is lost', async () => {

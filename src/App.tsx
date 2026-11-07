@@ -32,6 +32,7 @@ import { seedDemoData } from './demo/seed';
 import { requestRentOrder, syncRentOrder, type RentOrderResult } from './agent/rentOrders';
 import { buildSnapshot } from './agent/snapshot';
 import { analyzeRentAgent, type RentAgentResult } from './agent/rentAgent';
+import { TenantGrid } from './components/TenantGrid';
 import type { User } from 'firebase/auth';
 
 const currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
@@ -423,6 +424,12 @@ function App() {
 
   const unpaid = useMemo(() => calculateUnpaid(tenants, payments), [tenants, payments]);
   const activeTenants = useMemo(() => tenants.filter((tenant) => tenant.status === 'Active'), [tenants]);
+  const tenantSnapshotRows = useMemo(() => meta
+    ? buildSnapshot(meta, tenants, payments).tenants.map((tenant) => ({
+      ...tenant,
+      status: tenant.paymentMonths[tenant.paymentMonths.length - 1]?.status ?? 'unpaid',
+    }))
+    : [], [meta, tenants, payments]);
   const inactiveTenants = tenants.length - activeTenants.length;
   const currentMonth = format(new Date(), 'yyyy-MM');
   const unpaidThisMonth = activeTenants.filter((tenant) => {
@@ -628,36 +635,36 @@ function App() {
     try {
       const currentOrder = rentOrder;
       const synced = await syncRentOrder(currentOrder.orderId);
-      if (currentOrder.status === 'CANCELLED' && !['COMPLETED', 'VOIDED'].includes(synced.status)) {
-        synced.status = 'CANCELLED';
-        synced.approveUrl = null;
-      }
-      setRentOrder(synced);
-      localStorage.setItem(rentOrderStorageKey, JSON.stringify(synced));
-      if (synced.status === 'COMPLETED') {
-        if (!synced.captureId || !synced.allocations.length) {
+      const nextOrder = currentOrder.status === 'CANCELLED'
+        && !['COMPLETED', 'VOIDED'].includes(synced.status)
+        ? { ...synced, status: 'CANCELLED', approveUrl: null }
+        : synced;
+      setRentOrder(nextOrder);
+      localStorage.setItem(rentOrderStorageKey, JSON.stringify(nextOrder));
+      if (nextOrder.status === 'COMPLETED') {
+        if (!nextOrder.captureId || !nextOrder.allocations.length) {
           throw new Error('PayPal completed the order without a capture ID or payment allocation.');
         }
-        const tenant = tenants.find((item) => item.id === synced.tenantId);
+        const tenant = tenants.find((item) => item.id === nextOrder.tenantId);
         const paidOn = format(new Date(), 'yyyy-MM-dd');
-        for (const allocation of synced.allocations) {
+        for (const allocation of nextOrder.allocations) {
           const amount = Number(allocation.amount);
           if (!Number.isFinite(amount) || amount <= 0) {
             throw new Error('PayPal returned an invalid payment allocation.');
           }
           await savePayment({
-            id: `${synced.captureId}-${allocation.month}`,
-            tenantId: synced.tenantId,
-            tenantName: tenant?.name ?? synced.fullName ?? 'Tenant',
+            id: `${nextOrder.captureId}-${allocation.month}`,
+            tenantId: nextOrder.tenantId,
+            tenantName: tenant?.name ?? nextOrder.fullName ?? 'Tenant',
             month: allocation.month,
             amount,
             date: paidOn,
-            note: `PayPal capture ${synced.captureId}. The full rent order was captured; any Pay in 4 installments are between the buyer and PayPal.`,
+            note: `PayPal capture ${nextOrder.captureId}. The full rent order was captured; any Pay in 4 installments are between the buyer and PayPal.`,
             createdAt: new Date().toISOString(),
           });
         }
         await reloadLocalData();
-        setToast(`PayPal payment recorded · ${formatMoney(Number(synced.amount))}`);
+        setToast(`PayPal payment recorded · ${formatMoney(Number(nextOrder.amount))}`);
         window.setTimeout(() => setToast(''), 3000);
       }
     } finally {
@@ -879,11 +886,9 @@ function App() {
             <div className="cards-row">
               <section className="panel">
                 <div className="section-heading"><h3>Active tenants</h3><span className="summary-chip success">{activeTenants.length} active</span></div>
-                <ul className="list-stack">
-                  {activeTenants.length === 0 ? <EmptyState icon="♙" message="No active tenants. Add a tenant to start tracking occupancy." action="Add tenant" onClick={() => setRoute('tenants')} /> : activeTenants.slice(0, 5).map((tenant) => (
-                    <li key={tenant.id}><span>{tenant.name}</span><strong>{tenant.room}</strong></li>
-                  ))}
-                </ul>
+                {tenantSnapshotRows.length === 0
+                  ? <EmptyState icon="♙" message="No active tenants. Add a tenant to start tracking occupancy." action="Add tenant" onClick={() => setRoute('tenants')} />
+                  : <TenantGrid rows={tenantSnapshotRows} />}
               </section>
               <section className="panel">
                 <div className="section-heading"><h3>Payments to review</h3><span className={`summary-chip ${unpaidThisMonth ? 'warning' : 'success'}`}>{unpaidThisMonth} due this month</span></div>
@@ -940,7 +945,12 @@ function App() {
                           : 'Rules · No overdue rent'}
                     </span>
                   </div>
-                  {rentAgentResult.warning && <p className="field-help" role="status">{rentAgentResult.warning}</p>}
+                  {rentAgentResult.warning && (
+                    <p className="field-help" role="status">
+                      {rentAgentResult.warning}
+                      {rentAgentResult.reason ? ` Reason: ${rentAgentResult.reason.replace('_', ' ')}.` : ''}
+                    </p>
+                  )}
                   {rentAgentResult.cases.length === 0
                     ? <p className="field-help">No overdue tenants were found in this snapshot.</p>
                     : rentAgentResult.cases.map((agentCase) => {

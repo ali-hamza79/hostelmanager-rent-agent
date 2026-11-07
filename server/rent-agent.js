@@ -4,6 +4,7 @@ import { z } from 'zod';
 
 const MAX_TENANTS = 100;
 const MAX_RECENT_MONTHS = 3;
+const MAX_PAYMENT_MONTHS = 36;
 const AGENT_TIMEOUT_MS = 25_000;
 
 export const RENT_AGENT_SYSTEM_PROMPT = `You are Rent Agent for a hostel owner. You receive a JSON list of OVERDUE tenants only. Ranking is already decided by the server.
@@ -49,7 +50,7 @@ const tenantSchema = z.object({
   monthlyRent: z.number().finite().nonnegative(),
   outstandingAmount: z.number().finite().nonnegative(),
   monthsOverdue: z.number().int().nonnegative(),
-  recentMonths: z.array(monthSchema).max(MAX_RECENT_MONTHS),
+  recentMonths: z.array(monthSchema).max(MAX_PAYMENT_MONTHS),
 });
 
 const snapshotSchema = z.object({
@@ -61,6 +62,47 @@ const snapshotSchema = z.object({
 
 function money(value) {
   return value.toFixed(2);
+}
+
+function canonicalMoney(value) {
+  const normalized = value
+    .replace(/^(?:USD\s*|\$)\s*/i, '')
+    .replace(/\s+dollars?$/i, '');
+  if (!/^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$/.test(normalized)) return null;
+  const parsed = Number(normalized.replace(/,/g, ''));
+  return Number.isFinite(parsed) ? money(parsed) : null;
+}
+
+function quotedAmounts(text) {
+  const amounts = [];
+  const remaining = text.replace(/(?:\$|USD\s*)\s*\d[\d,]*(?:\.\d+)?/gi, (match) => {
+    amounts.push(canonicalMoney(match));
+    return ' ';
+  }).replace(/\b\d[\d,]*(?:\.\d+)?\s+dollars?\b/gi, (match) => {
+    amounts.push(canonicalMoney(match));
+    return ' ';
+  });
+  const plainAmounts = remaining.match(/(?<![\d.,])\d[\d,]*\.\d+(?![\d.,])/g) ?? [];
+  amounts.push(...plainAmounts.map(canonicalMoney));
+  return amounts;
+}
+
+function allowedAmounts(tenant) {
+  const amounts = new Set([money(tenant.outstandingAmount)]);
+  for (const month of tenant.recentMonths) {
+    amounts.add(money(month.rentDue));
+    amounts.add(money(month.amountPaid));
+    amounts.add(money(month.outstandingAmount));
+  }
+  return amounts;
+}
+
+function quotesOnlyKnownAmounts(text, amounts) {
+  return quotedAmounts(text).every((amount) => amount !== null && amounts.has(amount));
+}
+
+function mentionsAmount(text, amount) {
+  return quotedAmounts(text).some((quoted) => quoted === amount);
 }
 
 function displayMonth(month) {
@@ -108,16 +150,28 @@ function cleanModelResult(raw, rankedTenants, snapshot) {
   const parsed = modelOutputSchema.parse(raw);
   const byId = new Map(parsed.cases.map((agentCase) => [agentCase.tenantId, agentCase]));
   const fallback = makeFallback(rankedTenants, snapshot);
+  const allowedSummaryAmounts = new Set(rankedTenants.flatMap((tenant) => [...allowedAmounts(tenant)]));
 
   return {
-    summary: parsed.summary.trim() || fallback.summary,
+    summary: parsed.summary.trim() && quotesOnlyKnownAmounts(parsed.summary, allowedSummaryAmounts)
+      ? parsed.summary.trim()
+      : fallback.summary,
     cases: rankedTenants.map((tenant, index) => {
       const generated = byId.get(tenant.tenantId);
       const base = fallback.cases[index];
+      const amounts = allowedAmounts(tenant);
+      const explanation = generated?.explanation.trim();
+      const reminder = generated?.draftReminder.trim();
       return {
         ...base,
-        explanation: generated?.explanation.trim() || base.explanation,
-        draftReminder: generated?.draftReminder.trim() || base.draftReminder,
+        explanation: explanation && quotesOnlyKnownAmounts(explanation, amounts)
+          ? explanation
+          : base.explanation,
+        draftReminder: reminder
+          && mentionsAmount(reminder, money(tenant.outstandingAmount))
+          && quotesOnlyKnownAmounts(reminder, amounts)
+          ? reminder
+          : base.draftReminder,
         proposedAction: {
           ...base.proposedAction,
           description: generated?.proposedAction.description.trim() || base.proposedAction.description,
@@ -138,7 +192,7 @@ async function generateGeminiProse(input) {
     prompt: JSON.stringify(input),
     output: Output.object({ schema: modelOutputSchema }),
     maxOutputTokens: 4000,
-    maxRetries: 0,
+    maxRetries: 1,
     abortSignal: AbortSignal.timeout(AGENT_TIMEOUT_MS),
   });
   return result.output;
@@ -177,7 +231,7 @@ export async function analyzeRentSnapshot(rawSnapshot, generate = generateGemini
       room: tenant.room,
       outstandingAmount: money(tenant.outstandingAmount),
       monthsOverdue: tenant.monthsOverdue,
-      recentMonths: tenant.recentMonths,
+      recentMonths: tenant.recentMonths.slice(-MAX_RECENT_MONTHS),
     })),
   };
 
@@ -187,9 +241,15 @@ export async function analyzeRentSnapshot(rawSnapshot, generate = generateGemini
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown model error';
     console.warn(`Rent Agent model unavailable; using rules fallback: ${message}`);
+    const reason = /missing GOOGLE_GENERATIVE_AI_API_KEY/i.test(message)
+      ? 'missing_key'
+      : error?.name === 'TimeoutError' || error?.name === 'AbortError' || /timed?\s*out|timeout/i.test(message)
+        ? 'timeout'
+        : 'model_error';
     return {
       source: 'rules_fallback',
       ...fallback,
+      reason,
       warning: 'Model unavailable; used template text.',
     };
   }

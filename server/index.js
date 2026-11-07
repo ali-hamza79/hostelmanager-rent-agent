@@ -4,6 +4,7 @@ import cors from 'cors';
 import crypto from 'node:crypto';
 import { requireOwner } from './owner-auth.js';
 import { createRentOrder, proveRentAmount, rememberCancel, syncOrder } from './rent-orders.js';
+import { createRentOrderSyncHandler } from './rent-order-handlers.js';
 import { analyzeRentSnapshot } from './rent-agent.js';
 
    const {
@@ -167,13 +168,6 @@ app.get('/api/paypal/cancel', (req, res) => {
   return res.redirect(303, destination.toString());
 });
 
-app.post('/api/rent/orders/:orderId/sync', requireOwner, async (req, res) => {
-  try {
-    return res.json(await syncOrder(req.params.orderId));
-  } catch (error) {
-    console.error('PayPal order sync failed:', error);
-    return res.status(502).json({ error: error instanceof Error ? error.message : 'Could not sync the PayPal order.' });
-  }
-});
+app.post('/api/rent/orders/:orderId/sync', requireOwner, createRentOrderSyncHandler(syncOrder));
 
 app.listen(PORT, () => console.log(`Server on :${PORT}`));

@@ -18,6 +18,7 @@ export type RentAgentResult = {
   source: 'gemini' | 'rules_fallback' | 'rules';
   summary: string;
   cases: RentAgentCase[];
+  reason?: 'missing_key' | 'timeout' | 'model_error';
   warning?: string;
 };
 

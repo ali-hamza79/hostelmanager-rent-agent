@@ -94,9 +94,102 @@ test('returns ranked rules fallback if Gemini fails', async () => {
   });
 
   assert.equal(result.source, 'rules_fallback');
+  assert.equal(result.reason, 'model_error');
   assert.equal(result.cases[0].tenantId, 'daniel');
   assert.equal(result.cases[0].proposedAction.amount, '700.00');
   assert.ok(result.warning);
+});
+
+test('uses template prose when Gemini invents an amount or omits the balance', async () => {
+  const result = await analyzeRentSnapshot(snapshot([tenant()]), async () => ({
+    summary: 'Overdue tenant.',
+    cases: [{
+      ...generatedCase('daniel'),
+      explanation: 'The tenant owes $999.00.',
+      draftReminder: 'Please pay your rent soon.',
+    }],
+  }));
+
+  assert.match(result.cases[0].explanation, /700\.00 outstanding/);
+  assert.doesNotMatch(result.cases[0].explanation, /999\.00/);
+  assert.match(result.cases[0].draftReminder, /700\.00/);
+  assert.doesNotMatch(result.cases[0].draftReminder, /999\.00/);
+});
+
+test('rejects partial decimal matches and invented dollar-word amounts', async () => {
+  const result = await analyzeRentSnapshot(snapshot([tenant()]), async () => ({
+    summary: 'Overdue tenant.',
+    cases: [{
+      ...generatedCase('daniel'),
+      explanation: 'The correct balance is $700.001.',
+      draftReminder: 'Please pay 999 dollars to Maple House.',
+    }],
+  }));
+
+  assert.match(result.cases[0].explanation, /700\.00 outstanding/);
+  assert.match(result.cases[0].draftReminder, /700\.00/);
+  assert.doesNotMatch(result.cases[0].draftReminder, /999 dollars/);
+});
+
+test('allows grouped known amounts in Gemini prose', async () => {
+  const daniel = tenant({
+    outstandingAmount: 5600,
+    monthsOverdue: 4,
+    recentMonths: [
+      { month: '2026-08', rentDue: 1400, amountPaid: 0, outstandingAmount: 1400, status: 'unpaid' },
+      { month: '2026-09', rentDue: 1400, amountPaid: 0, outstandingAmount: 1400, status: 'unpaid' },
+      { month: '2026-10', rentDue: 1400, amountPaid: 0, outstandingAmount: 1400, status: 'unpaid' },
+    ],
+  });
+  const result = await analyzeRentSnapshot(snapshot([daniel]), async () => ({
+    summary: 'One overdue tenant.',
+    cases: [{
+      ...generatedCase('daniel'),
+      explanation: 'The balance is $5,600.00, including $1,400.00 due in October 2026.',
+      draftReminder: 'Please pay $5,600.00 to Maple House.',
+    }],
+  }));
+
+  assert.match(result.cases[0].explanation, /\$5,600\.00/);
+  assert.match(result.cases[0].draftReminder, /\$5,600\.00/);
+});
+
+test('limits Gemini context to the three latest months when the snapshot has older arrears', async () => {
+  const fourMonthTenant = tenant({
+    outstandingAmount: 1400,
+    monthsOverdue: 4,
+    recentMonths: [
+      { month: '2026-08', rentDue: 350, amountPaid: 0, outstandingAmount: 350, status: 'unpaid' },
+      { month: '2026-09', rentDue: 350, amountPaid: 0, outstandingAmount: 350, status: 'unpaid' },
+      { month: '2026-10', rentDue: 350, amountPaid: 0, outstandingAmount: 350, status: 'unpaid' },
+      { month: '2026-11', rentDue: 350, amountPaid: 0, outstandingAmount: 350, status: 'unpaid' },
+    ],
+  });
+  let modelInput;
+  await analyzeRentSnapshot(snapshot([fourMonthTenant]), async (input) => {
+    modelInput = input;
+    return {
+      summary: 'One overdue tenant.',
+      cases: [generatedCase('daniel')],
+    };
+  });
+
+  assert.equal(modelInput.tenants[0].recentMonths.length, 3);
+  assert.equal(modelInput.tenants[0].recentMonths[0].month, '2026-09');
+});
+
+test('classifies missing key and timeout fallback reasons', async () => {
+  const missingKey = await analyzeRentSnapshot(snapshot([tenant()]), async () => {
+    throw new Error('Missing GOOGLE_GENERATIVE_AI_API_KEY');
+  });
+  const timeout = await analyzeRentSnapshot(snapshot([tenant()]), async () => {
+    const error = new Error('Request timed out');
+    error.name = 'TimeoutError';
+    throw error;
+  });
+
+  assert.equal(missingKey.reason, 'missing_key');
+  assert.equal(timeout.reason, 'timeout');
 });
 
 test('rejects invalid snapshots and duplicate tenant IDs', async () => {

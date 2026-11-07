@@ -1,9 +1,24 @@
 import crypto from 'node:crypto';
 
 const apiBase = () => process.env.PAYPAL_API_BASE || 'https://api-m.sandbox.paypal.com';
+const PAYPAL_REQUEST_TIMEOUT_MS = 15_000;
 
 let token;
 let tokenExpiresAt = 0;
+
+async function fetchWithTimeout(url, options) {
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: AbortSignal.timeout(PAYPAL_REQUEST_TIMEOUT_MS),
+    });
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+      throw new Error('PayPal request timed out.');
+    }
+    throw error;
+  }
+}
 
 async function paypalToken() {
   if (token && Date.now() < tokenExpiresAt - 60_000) return token;
@@ -12,7 +27,7 @@ async function paypalToken() {
     throw new Error('PayPal credentials are not configured on the server.');
   }
 
-  const response = await fetch(`${apiBase()}/v1/oauth2/token`, {
+  const response = await fetchWithTimeout(`${apiBase()}/v1/oauth2/token`, {
     method: 'POST',
     headers: {
       Authorization: `Basic ${Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64')}`,
@@ -30,7 +45,7 @@ async function paypalToken() {
 
 export async function paypal(path, { method = 'GET', body, requestId } = {}) {
   const accessToken = await paypalToken();
-  const response = await fetch(`${apiBase()}${path}`, {
+  const response = await fetchWithTimeout(`${apiBase()}${path}`, {
     method,
     headers: {
       Authorization: `Bearer ${accessToken}`,

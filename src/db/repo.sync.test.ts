@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { dbPromise } from './idb';
+import type { Tenant } from '../types';
 import {
   deleteTenant,
   getExpenses,
@@ -37,7 +38,7 @@ describe('offline repository sync queue', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
-    await saveTenant({
+    const tenantRecord: Tenant = {
       id: 'tenant-1',
       name: 'Amina',
       phone: '',
@@ -48,7 +49,9 @@ describe('offline repository sync queue', () => {
       mess: '',
       rent: 10000,
       status: 'Active',
-    });
+      rentHistory: [{ effectiveMonth: '2026-01', amount: 10000 }],
+    };
+    await saveTenant(tenantRecord);
     await savePayment({
       id: 'payment-1',
       tenantId: 'tenant-1',
@@ -78,6 +81,9 @@ describe('offline repository sync queue', () => {
     expect(queue.map((item) => item.store).sort()).toEqual(['expenses', 'payments', 'rooms', 'tenants']);
     expect(queue.every((item) => item.action === 'upsert')).toBe(true);
     expect((await getTenants())[0].updatedAt).toBeTruthy();
+    expect((await getTenants())[0].rentHistory).toEqual(tenantRecord.rentHistory);
+    expect(queue.find((item) => item.store === 'tenants')?.payload.rentHistory).toEqual(tenantRecord.rentHistory);
+    expect('updatedAt' in tenantRecord).toBe(false);
   });
 
   it('records deletions as queued tombstone operations while deleting locally', async () => {

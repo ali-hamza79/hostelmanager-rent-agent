@@ -1,4 +1,4 @@
-import { format, subMonths } from 'date-fns';
+import { addMonths, format, parseISO, subMonths } from 'date-fns';
 import { buildRentByMonth, calculateUnpaid, rentForMonth } from '../db/rent';
 import type { HostelMeta, Payment, Tenant } from '../types';
 
@@ -15,6 +15,13 @@ export type AgentSnapshot = {
     outstandingAmount: number;
     monthsOverdue: number;
     recentMonths: Array<{
+      month: string;
+      rentDue: number;
+      amountPaid: number;
+      outstandingAmount: number;
+      status: 'paid' | 'partial' | 'unpaid';
+    }>;
+    paymentMonths: Array<{
       month: string;
       rentDue: number;
       amountPaid: number;
@@ -41,9 +48,6 @@ export function buildSnapshot(
   const unpaidByTenant = new Map(
     calculateUnpaid(activeTenants, payments).map((item) => [item.id, item]),
   );
-  const recentMonthKeys = [-2, -1, 0]
-    .map((offset) => format(subMonths(asOf, Math.abs(offset)), 'yyyy-MM'));
-
   return {
     hostelName: meta.name,
     asOf: format(asOf, 'yyyy-MM-dd'),
@@ -54,26 +58,28 @@ export function buildSnapshot(
         ? tenant.billingStartDate
         : joinMonth;
       const rentByMonth = buildRentByMonth(tenant, joinMonth);
-      const recentMonths = recentMonthKeys
-        .filter((month) => month >= firstMonth && month <= currentMonth)
-        .map((month) => {
-          const rentDue = rentForMonth(rentByMonth, month);
-          const amountPaid = payments
-            .filter((payment) => payment.tenantId === tenant.id && payment.month === month)
-            .reduce((total, payment) => total + Number(payment.amount), 0);
-          const outstandingAmount = money(Math.max(rentDue - amountPaid, 0));
-          const status: 'paid' | 'partial' | 'unpaid' = outstandingAmount === 0
-            ? 'paid'
-            : amountPaid === 0 ? 'unpaid' : 'partial';
-
-          return {
-            month,
-            rentDue: money(rentDue),
-            amountPaid: money(amountPaid),
-            outstandingAmount,
-            status,
-          };
+      const paymentMonths: AgentSnapshot['tenants'][number]['paymentMonths'] = [];
+      let monthCursor = firstMonth;
+      while (monthCursor <= currentMonth) {
+        const month = monthCursor;
+        const rentDue = rentForMonth(rentByMonth, month);
+        const amountPaid = payments
+          .filter((payment) => payment.tenantId === tenant.id && payment.month === month)
+          .reduce((total, payment) => total + Number(payment.amount), 0);
+        const outstandingAmount = money(Math.max(rentDue - amountPaid, 0));
+        const status: 'paid' | 'partial' | 'unpaid' = outstandingAmount === 0
+          ? 'paid'
+          : amountPaid === 0 ? 'unpaid' : 'partial';
+        paymentMonths.push({
+          month,
+          rentDue: money(rentDue),
+          amountPaid: money(amountPaid),
+          outstandingAmount,
+          status,
         });
+        monthCursor = format(addMonths(parseISO(`${month}-01`), 1), 'yyyy-MM');
+      }
+      const recentMonths = paymentMonths.slice(-3);
       const unpaid = unpaidByTenant.get(tenant.id);
 
       return {
@@ -85,6 +91,7 @@ export function buildSnapshot(
         outstandingAmount: money(unpaid?.amountDue ?? 0),
         monthsOverdue: unpaid?.monthsDue ?? 0,
         recentMonths,
+        paymentMonths,
       };
     }),
   };

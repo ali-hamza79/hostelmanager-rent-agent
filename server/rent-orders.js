@@ -1,3 +1,4 @@
+import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { paypal, money, newRequestId } from './paypal.js';
 
 const orders = new Map();
@@ -10,22 +11,27 @@ function isMoney(value) {
 }
 
 export function proveRentAmount(tenant) {
+  const paymentMonths = Array.isArray(tenant?.paymentMonths)
+    ? tenant.paymentMonths
+    : tenant?.recentMonths;
   if (!tenant || typeof tenant !== 'object'
     || typeof tenant.tenantId !== 'string'
     || !/^[A-Za-z0-9_-]{1,80}$/.test(tenant.tenantId)
     || typeof tenant.fullName !== 'string'
     || tenant.fullName.length === 0
     || typeof tenant.room !== 'string'
-    || !Array.isArray(tenant.recentMonths)
-    || tenant.recentMonths.length === 0
-    || tenant.recentMonths.length > 36) {
+    || !Array.isArray(paymentMonths)
+    || paymentMonths.length === 0) {
     throw new Error('Invalid tenant snapshot.');
+  }
+  if (paymentMonths.length > 36) {
+    throw new Error('A single PayPal rent request supports at most 36 monthly periods.');
   }
 
   const seenMonths = new Set();
   const allocations = [];
   let total = 0;
-  for (const month of tenant.recentMonths) {
+  for (const month of paymentMonths) {
     if (!month || typeof month.month !== 'string' || !monthPattern.test(month.month)
       || seenMonths.has(month.month)
       || !isMoney(month.rentDue)
@@ -55,7 +61,8 @@ export function proveRentAmount(tenant) {
 }
 
 function customIdFor(amount, allocations) {
-  return `${money(amount)}|USD|${allocations.map(({ month, amount: value }) => `${month}=${value}`).join(',')}`;
+  const compressed = deflateRawSync(Buffer.from(JSON.stringify(allocations))).toString('base64url');
+  return `${money(amount)}|USD|z:${compressed}`;
 }
 
 function parseOrderMetadata(order) {
@@ -63,11 +70,29 @@ function parseOrderMetadata(order) {
   const tenantId = purchaseUnit?.reference_id;
   const customId = purchaseUnit?.custom_id || '';
   const [amount, currency, allocationText] = customId.split('|');
-  const allocations = (allocationText || '').split(',').filter(Boolean).map((entry) => {
-    const [month, value] = entry.split('=');
+  let allocationRows;
+  if (allocationText?.startsWith('z:')) {
+    try {
+      allocationRows = JSON.parse(inflateRawSync(Buffer.from(allocationText.slice(2), 'base64url')).toString());
+    } catch {
+      throw new Error('PayPal order contains invalid compressed rent allocations.');
+    }
+  } else {
+    allocationRows = (allocationText || '').split(',').filter(Boolean).map((entry) => {
+      const [month, value] = entry.split('=');
+      return { month, amount: value };
+    });
+  }
+  if (!Array.isArray(allocationRows) || allocationRows.length > 36) {
+    throw new Error('PayPal order is missing valid payment allocation metadata.');
+  }
+  const seenMonths = new Set();
+  const allocations = allocationRows.map(({ month, amount: value }) => {
     if (!monthPattern.test(month || '') || !/^\d{1,8}\.\d{2}$/.test(value || '')) {
       throw new Error('PayPal order is missing valid payment allocation metadata.');
     }
+    if (seenMonths.has(month)) throw new Error('PayPal order contains duplicate payment months.');
+    seenMonths.add(month);
     return { month, amount: value };
   });
   const total = allocations.reduce((sum, item) => sum + Number(item.amount), 0);

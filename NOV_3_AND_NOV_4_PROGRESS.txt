@@ -1,14 +1,14 @@
 HOSTELAGENT PROJECT - PROGRESS AND TEST HANDOFF
-Updated: November 5, 2026 (local live rehearsal and packaging status)
+Updated: November 7, 2026 (deployment and rent-agent hardening status)
 
 PURPOSE
 =======
 
 This note records the work completed for the Nov 3 AI/data foundation, the
-Nov 4 approval-gated PayPal rent flow and Rent Agent, plus the Nov 5 live local
-rehearsal and remaining packaging/deployment work. It distinguishes
-implemented code, automated verification, Sandbox activity, and remaining
-checks. It does not contain API keys,
+Nov 4 approval-gated PayPal rent flow and Rent Agent, the Nov 5 local live
+rehearsal, and Nov 6-7 deployment and hardening work. It distinguishes
+implemented code, automated verification, Sandbox activity, deployed status,
+and remaining checks. It does not contain API keys,
 passwords, Firebase UIDs, or other credentials.
 
 
@@ -301,7 +301,7 @@ The server must be restarted after editing server/.env. The PWA must be
 restarted/rebuilt after changing VITE_ variables.
 
 
-11. CURRENT HANDOFF / NEXT CHECKS (UPDATED NOV 5)
+11. CURRENT HANDOFF / NEXT CHECKS (UPDATED NOV 7)
 ================================================
 
 Completed:
@@ -319,8 +319,8 @@ Completed:
   Copy reminder succeeded; owner Request created a distinct $700 Sandbox
   order; buyer paid in full; owner Sync showed `COMPLETED`, recorded the
   payment locally, and reduced the displayed balance from $1,080 to $380.
-- Latest automated verification: 29 frontend tests pass, 9 server tests pass,
-  and `npm run build` succeeds.
+- Latest automated verification (Nov 7 hardening): 30 frontend tests pass,
+  20 server tests pass, and `npm run build` succeeds.
 
 Important scope caveats:
 - The Nov 5 run used the existing signed-in Xyz workspace, not a clean Maple
@@ -335,8 +335,20 @@ Important scope caveats:
   cloud data. Its original owner is unknown. Keep it isolated; do not attach
   it to Ali or another tenant, and do not delete it unless it is positively
   identified as test-only. It is not part of the demo story.
-- No judge-facing server/PWA deployment has been verified yet. Do not claim
-  deployed checkout or cloud sync is ready.
+- Firebase Hosting is deployed at `https://hostelmanager-79bab.web.app`.
+  Hosting CSP now permits the Railway API origin.
+- Railway health was confirmed at
+  `https://hostelmanager-rent-agent-production.up.railway.app/health` with
+  HTTP 200 and `{"ok":true}`. This verifies server health only, not owner auth,
+  Gemini, or PayPal checkout.
+- The hosted Rent Agent was exercised and reached the API, but returned
+  `rules_fallback` because Gemini was unavailable. AI Studio screenshots
+  showed usage below displayed free-tier limits; they did not identify the
+  exact 404/503 causes. The live Railway log error still needs inspection.
+- The Nov 7 server and PWA hardening changes are local and tested but have not
+  been confirmed pushed/deployed. The hosted app therefore may still run the
+  earlier implementation.
+- No complete PayPal Sandbox transaction has been confirmed on deployed URLs.
 - Browser-supplied snapshot data is not an authoritative production ledger.
   Keep the demo owner-restricted and Sandbox-only.
 
@@ -346,16 +358,19 @@ Remaining critical path:
    existing Xyz workspace to achieve this.
 2. Resolve or safely isolate the identified orphan payment only after
    confirming whether it is test-only; leave it untouched if uncertain.
-3. Deploy the Node server and PWA with exact CORS/PayPal return origins and
-   server-only credentials, then repeat the buyer checkout on deployed URLs.
-4. Update the Devpost entry and record the sub-3-minute video only after the
+3. Inspect Railway logs for the exact Gemini provider error; verify the live
+   Railway configuration and model availability.
+4. Push/deploy the Nov 7 changes, then test owner auth and a complete PayPal
+   Sandbox checkout on deployed URLs. Re-test Google sign-in on Hosting.
+5. Prepare a clean demo profile and repeat Maple House rehearsal.
+6. Update the Devpost entry and record the sub-3-minute video only after the
    clean-profile and deployed rehearsal.
 
 Never share `.env` screenshots or credential values. Rotate secrets that
 appeared in chat or screenshots.
 
 
-12. NOV 5 RENT AGENT IMPLEMENTATION (COMPLETED NOV 4)
+12. RENT AGENT IMPLEMENTATION (COMPLETED NOV 4)
 =====================================================
 
 Implemented the amended Nov 5 plan in the project on Nov 4:
@@ -568,11 +583,76 @@ Sync caveat:
   must not be assigned to another tenant without proof of its owner.
 
 Packaging/deployment:
-- README updated with the current workflow, stack, local rehearsal result,
-  configuration names, snapshot trust limitation, duplicate-room behavior,
-  and orphan payment handling.
-- No production/judge-facing deployment, clean Maple House rehearsal,
-  Devpost submission, or final video playback has been verified yet.
+- README and progress handoff include the current workflow, configuration,
+  local rehearsal, known limits, and deployment status.
+- Firebase Hosting is deployed and the Railway health endpoint is live, but
+  the clean Maple House rehearsal and full hosted PayPal transaction are not
+  yet verified. Devpost submission and final video playback are also open.
 - Continue with a genuinely fresh browser profile for `?demo=1`, deploy the
-  PWA/API with exact origin settings, repeat the complete flow on deployed
+  latest unshipped hardening changes, repeat the complete flow on deployed
   URLs, then finish the Devpost entry and video.
+
+
+16. NOV 7 RENT AGENT / ARREARS HARDENING (LOCAL, TESTED)
+=================================================
+
+- Gemini explanations and reminders are checked for quoted money amounts.
+  Amounts must match the tenant's known balance/month data; a reminder must
+  include the exact outstanding balance. Otherwise that text is replaced by
+  the deterministic template. Gemini summaries with unknown quoted amounts
+  are replaced as well.
+- Gemini calls now allow one provider retry. Rules fallback remains available
+  and includes a safe reason code: `missing_key`, `timeout`, or `model_error`;
+  the PWA displays that code alongside the fallback warning.
+- Rent snapshots now carry full monthly payment history in `paymentMonths`
+  while retaining only the latest three months in `recentMonths` for model
+  context. The PayPal request verifier uses the full history, fixing amount
+  reconciliation for tenants owing four or more months.
+- Gemini quoted amounts are checked using full numeric-token matching;
+  partially matching malformed decimals such as `$700.001` and amount text
+  such as `999 dollars` are rejected from generated prose.
+- PayPal month allocations are compressed into the `custom_id` metadata and
+  decompressed/validated during order recovery. This fixes normal multi-month
+  requests that exceeded the 127-character limit with the previous verbose
+  encoding. The 36-month and $5,000 caps remain; unusually large compressed
+  metadata is explicitly rejected before order creation.
+- Added regressions for invented/missing prose amounts, grouped known
+  amounts, fallback reason codes, model context limited to three months, and
+  four-month snapshot/order allocation, eight-month compressed PayPal
+  metadata, and exact numeric token boundaries.
+- Verification: PWA 30 tests passed; server 20 tests passed; production build
+  passed. The new server/PWA changes still need to be pushed and deployed to
+  GitHub/Railway/Firebase before considering the live hosted app updated.
+- The in-memory one-open-order-per-tenant check still resets on Railway
+  restart; recovery of a known PayPal order works, but durable cross-restart
+  duplicate prevention has not been implemented.
+
+
+17. NOV 6-7 HOSTED DEPLOYMENT STATUS
+===================================
+
+- A Firebase Hosting deployment completed at
+  `https://hostelmanager-79bab.web.app`. The deployed PWA was rebuilt with
+  `VITE_API_BASE_URL=https://hostelmanager-rent-agent-production.up.railway.app`.
+- The Hosting CSP `connect-src` now includes the Railway API origin.
+- Railway Networking showed the service domain
+  `hostelmanager-rent-agent-production.up.railway.app` on port 8080.
+  `curl -i https://hostelmanager-rent-agent-production.up.railway.app/health`
+  returned HTTP 200, CORS allow-origin for the Firebase Hosting site, and
+  `{"ok":true}`.
+- The deployed UI successfully called the Rent Agent endpoint and displayed
+  results. A later run showed `Rules fallback · Gemini unavailable`; Gemini
+  API usage screenshots showed 3.6 Flash requests below the displayed free
+  tier RPM/TPM/RPD limits, but do not reveal the exact provider errors. The
+  backend log line beginning `Rent Agent model unavailable; using rules
+  fallback:` is needed to diagnose Google 404/503 responses.
+- Firebase Google sign-in configuration was identified as a separate path
+  from Railway: verify Google provider enabled and
+  `hostelmanager-79bab.web.app` listed under Firebase Authentication
+  Authorized domains. Railway credentials do not configure browser sign-in.
+- The latest deployment commands for Hosting succeeded, but GitHub remained
+  clean/up-to-date at the time checked. The Nov 7 local hardening edits were
+  made after that deployment and are not confirmed pushed to GitHub or
+  deployed to Railway/Firebase.
+- No complete deployed PayPal buyer approval/capture/sync rehearsal has yet
+  been confirmed. Local Sandbox rehearsal remains the verified payment path.
